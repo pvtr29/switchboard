@@ -21,6 +21,10 @@ updated in that same transaction; a group whose events cannot be folded is rolle
 ``append_group`` is atomic. A group larger than ``max_batch`` is committed whole on its own.
 Acks are sent only after COMMIT returned.
 
+Optional `linger` (seconds, default 0 = off): when the previous batch held more than one group
+and the queue is empty, the writer waits `linger` before committing so that more callers join
+the batch. It trades up to `linger` of ack latency, only under load, for fewer transactions.
+
 Backpressure: the queue is bounded; ``append`` awaits ``queue.put`` when it is full, so
 producers slow down instead of memory growing.
 
@@ -36,6 +40,8 @@ Cancellation: a caller cancelled while awaiting its ack may still have its event
 
 import asyncio
 import logging
+import time
+from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -44,10 +50,14 @@ from types import TracebackType
 from typing import Self
 
 from switchboard.core import Event, Job, JobState
-from switchboard.store.interface import AppendResult, AppendStatus, EffectRecord
-from switchboard.store.sqlite import SQLiteEventLog, _with_seq, encode_event, open_db
+from switchboard.obs.stats import LatencySnapshot, LatencyWindow
+from switchboard.store.interface import AppendResult, AppendStatus, EffectRecord, GroupResult
+from switchboard.store.sqlite import Row, SQLiteEventLog, _with_seq, encode_event, open_db
 
 logger = logging.getLogger("switchboard.store")
+
+LATENCY_WINDOW = 8192  # samples kept per latency series
+JOB_MIRROR_SIZE = 100_000  # job projections kept in memory (least recently changed evicted)
 
 type CommitListener = Callable[[Sequence[Event]], None]
 
@@ -76,7 +86,35 @@ class StoreStats:
     queue_depth: int
 
 
-type _Item = tuple[list[Event], asyncio.Future[list[AppendResult]]]
+@dataclass(frozen=True, slots=True)
+class StoreLatency:
+    """Write-path timings over the most recent batches/appends (bounded memory).
+
+    `commit_s`: per committed batch, the time spent in the writer thread (BEGIN to COMMIT).
+    `ack_s`: per append call, from entering the queue to the ack being resolved (queue wait +
+    commit + listeners). `batch_events` / `batch_groups`: batch sizes (values are counts).
+    """
+
+    commit_s: LatencySnapshot
+    ack_s: LatencySnapshot
+    batch_events: LatencySnapshot
+    batch_groups: LatencySnapshot
+
+
+@dataclass(slots=True)
+class _Item:
+    group: list[Event]
+    rows: list[Row]
+    fut: asyncio.Future[list[AppendResult]]
+    enqueued: float
+
+
+def _commit_in_thread(
+    log: SQLiteEventLog, groups: list[list[Event]], rows: list[list[Row]]
+) -> tuple[list[GroupResult], float, dict[str, Job]]:
+    t0 = time.perf_counter()
+    outcomes = log.append_encoded(groups, rows)
+    return outcomes, time.perf_counter() - t0, log.last_changed
 
 
 def _close_in_thread(log: SQLiteEventLog) -> None:
@@ -90,9 +128,14 @@ class EventStore:
         *,
         max_batch: int = 512,
         queue_size: int = 10_000,
+        linger: float = 0.0,
     ) -> None:
         if max_batch < 1 or queue_size < 1:
             raise ValueError("max_batch and queue_size must be >= 1")
+        if linger < 0:
+            raise ValueError("linger must be >= 0")
+        self._linger = linger
+        self._last_groups = 1
         self._path = path
         self._max_batch = max_batch
         self._queue: asyncio.Queue[_Item | None] = asyncio.Queue(maxsize=queue_size)
@@ -111,14 +154,24 @@ class EventStore:
         self._duplicates = 0
         self._rejected_groups = 0
         self._max_batch_seen = 0
+        self._jobs: OrderedDict[str, Job] = OrderedDict()
+        self._commit_lat = LatencyWindow(LATENCY_WINDOW)
+        self._ack_lat = LatencyWindow(LATENCY_WINDOW)
+        self._batch_events = LatencyWindow(LATENCY_WINDOW)
+        self._batch_groups = LatencyWindow(LATENCY_WINDOW)
         self._close_lock = asyncio.Lock()
         self._listeners: list[CommitListener] = []
 
     @classmethod
     async def open(
-        cls, path: str | Path, *, max_batch: int = 512, queue_size: int = 10_000
+        cls,
+        path: str | Path,
+        *,
+        max_batch: int = 512,
+        queue_size: int = 10_000,
+        linger: float = 0.0,
     ) -> Self:
-        store = cls(path, max_batch=max_batch, queue_size=queue_size)
+        store = cls(path, max_batch=max_batch, queue_size=queue_size, linger=linger)
         loop = asyncio.get_running_loop()
         try:
             # Connections are created inside their owning threads. Writer first: it runs the
@@ -165,13 +218,15 @@ class EventStore:
         WriterCrashed if the writer died.
         """
         group = list(events)
-        for e in group:
-            encode_event(e)  # same rules as the log; fail before the group can poison a batch
+        # Same rules as the log; fail before the group can poison a batch. The rows are encoded
+        # exactly once, here, and travel with the group to the writer thread.
+        rows = [encode_event(e) for e in group]
         if not group:
             return []
         self._check_open()
         fut: asyncio.Future[list[AppendResult]] = asyncio.get_running_loop().create_future()
-        await self._queue.put((group, fut))  # backpressure: waits while the queue is full
+        item = _Item(group, rows, fut, time.perf_counter())
+        await self._queue.put(item)  # backpressure: waits while the queue is full
         if self._failure is not None and not fut.done():
             fut.set_exception(self._failure)
         return await fut
@@ -193,8 +248,12 @@ class EventStore:
                 if first is None:
                     return
             batch = [first]
-            count = len(first[0])
+            count = len(first.group)
             stop = False
+            if self._linger and self._last_groups > 1 and self._queue.empty():
+                # Under load (the previous batch had several groups) wait a moment so more
+                # callers can join: fewer, bigger transactions. An idle store never lingers.
+                await asyncio.sleep(self._linger)
             while count < self._max_batch:
                 try:
                     item = self._queue.get_nowait()
@@ -203,20 +262,23 @@ class EventStore:
                 if item is None:
                     stop = True
                     break
-                if count + len(item[0]) > self._max_batch:
+                if count + len(item.group) > self._max_batch:
                     self._carry = item
                     break
                 batch.append(item)
-                count += len(item[0])
+                count += len(item.group)
             self._inflight = batch
-            groups = [group for group, _ in batch]
+            groups = [item.group for item in batch]
+            rows = [item.rows for item in batch]
             try:
-                outcomes = await loop.run_in_executor(self._wexec, self._log.append_groups, groups)
+                outcomes, commit_s, changed = await loop.run_in_executor(
+                    self._wexec, _commit_in_thread, self._log, groups, rows
+                )
             except Exception as exc:
                 # e.g. disk error: the transaction rolled back, so nothing in it was written.
-                for _, fut in batch:
-                    if not fut.done():
-                        fut.set_exception(exc)
+                for item in batch:
+                    if not item.fut.done():
+                        item.fut.set_exception(exc)
                 self._inflight = []
                 if stop:
                     return
@@ -226,10 +288,17 @@ class EventStore:
                 raise RuntimeError(
                     f"append_groups returned {len(outcomes)} for {len(batch)} groups"
                 )
+            self._mirror(changed)
+            self._last_groups = len(batch)
             self._transactions += 1
             self._max_batch_seen = max(self._max_batch_seen, count)
+            self._commit_lat.record(commit_s)
+            self._batch_events.record(count)
+            self._batch_groups.record(len(batch))
             committed: list[Event] = []
-            for (group, fut), outcome in zip(batch, outcomes, strict=True):
+            acked: list[float] = []
+            for item, outcome in zip(batch, outcomes, strict=True):
+                group, fut = item.group, item.fut
                 if isinstance(outcome, Exception):
                     # Projection-invalid group: nothing of it was written; others committed.
                     self._rejected_groups += 1
@@ -248,8 +317,12 @@ class EventStore:
                 self._duplicates += sum(r.status is AppendStatus.DUPLICATE for r in outcome)
                 if not fut.done():  # a cancelled caller no longer wants its ack
                     fut.set_result(outcome)
+                    acked.append(item.enqueued)
             if committed:
                 self._notify(committed)
+            now = time.perf_counter()
+            for enqueued in acked:
+                self._ack_lat.record(now - enqueued)
             self._inflight = []
             if stop:
                 return
@@ -291,9 +364,9 @@ class EventStore:
                 break
             if item is not None:
                 pending.append(item)
-        for _, fut in pending:
-            if not fut.done():
-                fut.set_exception(failure)
+        for item in pending:
+            if not item.fut.done():
+                item.fut.set_exception(failure)
 
     # ---- reading -------------------------------------------------------------------------
 
@@ -314,7 +387,24 @@ class EventStore:
     async def last_seq(self) -> int:
         return await self._read("last_seq")
 
+    def _mirror(self, changed: dict[str, Job]) -> None:
+        jobs = self._jobs
+        for jid, job in changed.items():
+            jobs[jid] = job
+            jobs.move_to_end(jid)
+        while len(jobs) > JOB_MIRROR_SIZE:
+            jobs.popitem(last=False)
+
     async def get_job(self, job_id: str) -> Job | None:
+        """The job's projection as of the last commit. Served from memory when the job changed
+        recently (the writer mirrors every projection it writes, before acking the caller, so a
+        caller always sees its own writes); otherwise read from SQLite. Never a thread hop on a
+        hit, which matters when thousands of runners poll their job once per step."""
+        if self._closed:
+            raise StoreClosed("event store is closed")
+        job = self._jobs.get(job_id)
+        if job is not None:
+            return job
         return await self._read("get_job", job_id)
 
     async def get_effect(self, effect_id: str) -> EffectRecord | None:
@@ -333,6 +423,20 @@ class EventStore:
             max_batch_seen=self._max_batch_seen,
             queue_depth=self._queue.qsize(),
         )
+
+    @property
+    def latency(self) -> StoreLatency:
+        return StoreLatency(
+            commit_s=self._commit_lat.snapshot(),
+            ack_s=self._ack_lat.snapshot(),
+            batch_events=self._batch_events.snapshot(),
+            batch_groups=self._batch_groups.snapshot(),
+        )
+
+    def reset_latency(self) -> None:
+        """Forget the latency samples (a benchmark does this after ramp-up)."""
+        for w in (self._commit_lat, self._ack_lat, self._batch_events, self._batch_groups):
+            w.reset()
 
     # ---- shutdown ------------------------------------------------------------------------
 

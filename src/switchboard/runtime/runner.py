@@ -18,10 +18,16 @@ Environment (optional, `env=`): a fresh job is provisioned and S(0) is snapshott
 After the act phase and BEFORE the commit group the runner snapshots S(n+1) as
 `s{n+1}-a{attempt}` and puts the ref in step_completed. The attempt suffix means a snapshot
 orphaned by a crash between snapshot and commit can never be mistaken for a committed one; it
-is harmless and the next gc deletes it. After each commit gc keeps the initial ref and the
-last `keep_last` committed refs. On resume (job already running) the runner ALWAYS restores
-S(n) first, because an interrupted act phase may have left uncommitted changes, and logs a
-`restored` event. A missing snapshot fails the job with reason "snapshot missing".
+is harmless and the next gc deletes it.
+
+Skip-unchanged: when the environment can prove the step changed nothing
+(`ChangeDetectingEnvironment.changed_since(S(n)'s ref)` is False) no snapshot is taken and
+step_completed carries S(n)'s ref again; any doubt snapshots as before.
+
+After each commit gc keeps the initial ref and the last `keep_last` distinct committed refs.
+On resume (job already running) the runner ALWAYS restores S(n) first, because an interrupted
+act phase may have left uncommitted changes, and logs a `restored` event.
+A missing snapshot fails the job with reason "snapshot missing".
 
 Failure policy: an `Exception` from the agent fails the job (state_changed running -> failed,
 reason "agent error: ...") and `run_job` RETURNS the failed job instead of raising, so a
@@ -77,7 +83,7 @@ from switchboard.core import (
     usage_from_dict,
     usage_to_dict,
 )
-from switchboard.env.base import Environment, SnapshotMissing
+from switchboard.env.base import ChangeDetectingEnvironment, Environment, SnapshotMissing
 from switchboard.runtime.agent import (
     ActResult,
     Agent,
@@ -96,7 +102,7 @@ from switchboard.runtime.budget import (
     TokenBucket,
 )
 from switchboard.runtime.effects import EffectJournal, ExternalSink
-from switchboard.store import AppendStatus, EventStore
+from switchboard.store import AppendResult, AppendStatus, EventStore
 
 REASON_CONFIG_CHANGED = "config changed"
 REASON_RESTART_LIMIT = "restart limit"
@@ -120,6 +126,16 @@ class _LogView:
         self.initial_ref: str | None = None
         self.ran = False  # the job has been in `running` at least once (see run_job)
         self.warned: set[tuple[str, float]] = set()  # (dimension, limit) already warned about
+        self.add(events)
+        if self.created is None:
+            raise JobNotRunnable("job has no job_created event")
+        if sorted(self.completed) != list(range(len(self.completed))):
+            raise RuntimeError(
+                f"step_completed events are not contiguous: {sorted(self.completed)}"
+            )
+
+    def add(self, events: Sequence[Event]) -> None:
+        """Fold more events of this job (in log order) into the view."""
         for e in events:
             match e.type:
                 case EventType.JOB_CREATED:
@@ -142,12 +158,6 @@ class _LogView:
                     self.warned.add((str(e.payload["dimension"]), float(e.payload["limit"])))
                 case _:
                     pass
-        if self.created is None:
-            raise JobNotRunnable("job has no job_created event")
-        if sorted(self.completed) != list(range(len(self.completed))):
-            raise RuntimeError(
-                f"step_completed events are not contiguous: {sorted(self.completed)}"
-            )
 
     @property
     def seed(self) -> int:
@@ -173,12 +183,16 @@ class _LogView:
         return None if ref is None else str(ref)
 
     def keep_refs(self, last: int) -> list[str]:
-        refs = [
-            r
-            for n in range(max(0, len(self.completed) - last), len(self.completed))
-            if (r := self.completed[n].payload.get("env_ref"))
-        ]
-        return [*([self.initial_ref] if self.initial_ref else []), *map(str, refs)]
+        """The initial ref plus the last `last` DISTINCT committed refs (a step that changed
+        nothing reuses its predecessor's ref, which must not use up a retention slot)."""
+        recent: list[str] = []
+        for n in range(len(self.completed) - 1, -1, -1):
+            if len(recent) >= last:
+                break
+            ref = self.completed[n].payload.get("env_ref")
+            if ref and str(ref) not in recent:
+                recent.append(str(ref))
+        return [*([self.initial_ref] if self.initial_ref else []), *reversed(recent)]
 
     def recorded_hashes(self) -> set[str]:
         assert self.created is not None
@@ -205,6 +219,22 @@ def _decode_response(e: Event) -> ModelResponse:
         usage=usage_from_dict(p["usage"]),
         model=p["model"],
     )
+
+
+async def _snapshot_step(
+    env: Environment, prev_ref: str | None, n: int, attempt: int, keep_last: int
+) -> str:
+    """S(n+1)'s env_ref: the previous ref when the step provably changed nothing, else a new
+    snapshot. Reuse needs `keep_last >= 1` so gc keeps S(n)'s snapshot, which is then the one
+    step_completed(n) points at."""
+    if (
+        prev_ref is not None
+        and keep_last >= 1
+        and isinstance(env, ChangeDetectingEnvironment)
+        and not await env.changed_since(prev_ref)
+    ):
+        return prev_ref
+    return await env.snapshot(f"s{n + 1}-a{attempt}")
 
 
 def _step_rng(seed: int, step: int) -> random.Random:
@@ -307,6 +337,19 @@ async def run_job(
             ]
         )
         return await _current()
+
+    async def append_tracked(events: list[Event]) -> list[AppendResult]:
+        """Append a group and keep `log` in step with it without re-reading the job's whole log
+        (a read per step made every step O(log length) and the reader thread the bottleneck at
+        thousands of jobs). Anything but a clean insert (a duplicate: someone else logged the
+        same fact) falls back to a full re-read, so the log stays authoritative."""
+        nonlocal log
+        results = await store.append_group(events)
+        if all(r.status is AppendStatus.INSERTED for r in results):
+            log.add(events)
+        else:
+            log = _LogView(await store.read_job(job_id))
+        return results
 
     async def _current() -> Job:
         current = await store.get_job(job_id)
@@ -414,7 +457,7 @@ async def run_job(
             await store.append_group(
                 [event(EventType.RESTORED, {"step": n, "env_ref": ref, "reason": "resume"})]
             )
-        await store.append_group([event(EventType.STEP_STARTED, {"attempt": attempt}, n)])
+        await append_tracked([event(EventType.STEP_STARTED, {"attempt": attempt}, n)])
 
         ctx = StepContext(
             job_id=job_id,
@@ -485,7 +528,7 @@ async def run_job(
                 return await fail(f"agent error: {type(sample_error).__name__}: {sample_error}")
             if budget is not None and reservation is not None:
                 budget.settle(reservation, response.usage)
-            results = await store.append_group(
+            results = await append_tracked(
                 [
                     event(
                         EventType.LLM_RESPONDED,
@@ -521,8 +564,7 @@ async def run_job(
             )
             if results[0].status is AppendStatus.DUPLICATE:
                 # Another runner logged n first: its response is the one of record.
-                log = _LogView(await store.read_job(job_id))
-                response = _decode_response(log.responded[n])
+                response = _decode_response(log.responded[n])  # `log` was re-read
 
         # ---- act phase (+ snapshot): inside the preemption scope -----------------------------
         act_error: Exception | None = None
@@ -536,7 +578,9 @@ async def run_job(
                     act_error = exc
                 else:
                     if env is not None:
-                        env_ref = await env.snapshot(f"s{n + 1}-a{attempt}")
+                        env_ref = await _snapshot_step(
+                            env, log.ref_before(n), n, attempt, keep_last
+                        )
         except TimeoutError:
             if cm.expired():
                 return await over_budget(PREEMPTED, record_active=True)
@@ -566,12 +610,12 @@ async def run_job(
         if result.done:
             group.append(state_change(JobState.RUNNING, JobState.VERIFYING, "agent finished"))
         try:
-            committed = await store.append_group(group)
+            committed = await append_tracked(group)
         except ProjectionError:
             # The state move was refused: someone else already moved the job (and the group
-            # rolled back). Re-read below and let the log decide.
+            # rolled back). Re-read and let the log decide.
             committed = []
-        log = _LogView(await store.read_job(job_id))
+            log = _LogView(await store.read_job(job_id))
         if env is not None and n in log.completed:
             await env.gc(log.keep_refs(keep_last))
         if committed and committed[0].status is AppendStatus.INSERTED and result.done:

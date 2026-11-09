@@ -49,8 +49,14 @@ def patch_append_groups(
         list[GroupResult],
     ],
 ) -> None:
-    real = store._log.append_groups
-    monkeypatch.setattr(store._log, "append_groups", lambda groups: wrapper(real, groups))
+    # The writer hands pre-encoded rows to append_encoded (events are encoded once, in the
+    # caller's task), so that is the call to intercept.
+    real = store._log.append_encoded
+    monkeypatch.setattr(
+        store._log,
+        "append_encoded",
+        lambda groups, rows: wrapper(lambda g: real(g, rows), groups),
+    )
 
 
 @pytest.mark.asyncio

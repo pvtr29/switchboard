@@ -84,10 +84,22 @@ class FakeModel:
         *,
         token_interval: float = 0.01,
         on_token: TokenHook | None = None,
+        token_jitter: float = 0.0,
     ) -> None:
         self.name = name
         self.token_interval = token_interval
+        self.token_jitter = token_jitter
         self.on_token = on_token
+
+    def _delay(self) -> float:
+        """The pause before a token. With `token_jitter` j each pause is scaled by a factor in
+        [1-j, 1+j], drawn from the GLOBAL random module, never from `ctx.rng`: timing is not
+        part of the response, so responses stay a pure function of (seed, step). Real model
+        streams are jittery; without it thousands of benchmark agents woken by the same
+        group commit stay in lock-step and hit the loop as one burst."""
+        if not self.token_jitter:
+            return self.token_interval
+        return self.token_interval * (1.0 + self.token_jitter * (2.0 * random.random() - 1.0))
 
     async def sample(self, ctx: StepContext, history: Sequence[Message]) -> ModelResponse:
         rng = ctx.rng
@@ -97,7 +109,7 @@ class FakeModel:
             k = min(k, ctx.max_output_tokens)
         tokens: list[str] = []
         for i in range(k):
-            await asyncio.sleep(self.token_interval)
+            await asyncio.sleep(self._delay())
             tokens.append(f"tok{rng.randint(0, 999)}")
             if self.on_token is not None:
                 self.on_token(ctx, i)
@@ -146,6 +158,7 @@ class FakeAgent:
         effect_policy: ReplayPolicy = ReplayPolicy.KEYED,
         naive_sink: ExternalSink | None = None,
         exit_at_step: int | None = None,
+        token_jitter: float = 0.0,
     ) -> None:
         self.effect_every = effect_every
         self.effect_policy = effect_policy
@@ -159,7 +172,9 @@ class FakeAgent:
         self.steps = steps
         self.fail_at_step = fail_at_step
         self.system_prompt = system_prompt
-        self.model = FakeModel(token_interval=token_interval, on_token=on_token)
+        self.model = FakeModel(
+            token_interval=token_interval, on_token=on_token, token_jitter=token_jitter
+        )
         self.tools: Sequence[ToolSpec] = (*TOOLS, *FILE_TOOLS)
         self.config_hash = hashlib.sha256(
             json.dumps(

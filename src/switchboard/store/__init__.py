@@ -10,7 +10,13 @@ from switchboard.store.interface import (
 )
 from switchboard.store.schema import SCHEMA_VERSION, SchemaVersionError, migrate
 from switchboard.store.sqlite import PAYLOAD_VERSIONS, SQLiteEventLog, encode_event, open_db
-from switchboard.store.writer import EventStore, StoreClosed, StoreStats, WriterCrashed
+from switchboard.store.writer import (
+    EventStore,
+    StoreClosed,
+    StoreLatency,
+    StoreStats,
+    WriterCrashed,
+)
 
 __all__ = [
     "PAYLOAD_VERSIONS",
@@ -24,6 +30,7 @@ __all__ = [
     "SQLiteEventLog",
     "SchemaVersionError",
     "StoreClosed",
+    "StoreLatency",
     "StoreStats",
     "UnknownEventVersion",
     "WriterCrashed",

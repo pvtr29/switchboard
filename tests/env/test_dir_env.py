@@ -1,5 +1,7 @@
+import asyncio
 import os
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -243,3 +245,85 @@ async def test_failing_cp_falls_back_to_copytree(
     monkeypatch.setattr(dir_env, "_cp", failing)
     await env.provision()
     assert (env.workdir / "a" / "b" / "deep.txt").read_text() == "deep"
+
+
+# ---- skip-unchanged: changed_since ---------------------------------------------------------
+
+
+@pytest.fixture
+def trusting(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fingerprints are only trusted once their entries are older than RACY_NS; tests that want
+    a trusted fingerprint turn the window off instead of sleeping."""
+    monkeypatch.setattr(dir_env, "RACY_NS", 0)
+
+
+async def _later() -> None:
+    await asyncio.sleep(0.02)  # timestamps must differ even on filesystems with coarse clocks
+
+
+async def test_changed_since_unknown_or_missing_ref_is_changed(env: DirEnv, trusting: None) -> None:
+    await env.provision()
+    assert await env.changed_since("nope") is True
+    await env.snapshot("s")
+    assert await env.changed_since("s") is False
+    shutil.rmtree(env.snapshots_dir / "s")  # fingerprint kept, snapshot gone: not reusable
+    assert await env.changed_since("s") is True
+
+
+async def test_changed_since_untouched_workdir_is_unchanged(env: DirEnv, trusting: None) -> None:
+    await env.provision()
+    await env.snapshot("s")
+    await _later()
+    assert await env.changed_since("s") is False
+    # Reading, listing and touching ignored directories do not count.
+    (env.workdir / "top.txt").read_text()
+    (env.workdir / "__pycache__").mkdir()
+    (env.workdir / "__pycache__" / "x.pyc").write_text("x")
+    assert await env.changed_since("s") is False
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda w: (w / "top.txt").write_text("TOP"), id="same-size-rewrite"),
+        pytest.param(lambda w: (w / "new.txt").write_text("n"), id="new-file"),
+        pytest.param(lambda w: (w / "top.txt").unlink(), id="delete-file"),
+        pytest.param(lambda w: (w / "empty").rmdir(), id="remove-dir"),
+        pytest.param(lambda w: (w / "run.sh").chmod(0o644), id="chmod"),
+        pytest.param(lambda w: (w / "a" / "b" / "deep.txt").write_text("deeper"), id="deep"),
+        pytest.param(lambda w: (w / "link").unlink() or (w / "link").symlink_to("a"), id="symlink"),
+        pytest.param(lambda w: (w / "top.txt").rename(w / "moved.txt"), id="rename"),
+    ],
+)
+async def test_changed_since_detects_every_kind_of_change(
+    env: DirEnv, trusting: None, mutate: Callable[[Path], object]
+) -> None:
+    await env.provision()
+    await env.snapshot("s")
+    await _later()
+    mutate(env.workdir)
+    assert await env.changed_since("s") is True
+
+
+async def test_changed_since_distrusts_fresh_fingerprints(env: DirEnv) -> None:
+    """Default window: files written a moment ago could change again unseen, so say changed."""
+    await env.provision()
+    await env.snapshot("s")  # the copied files are brand new
+    assert await env.changed_since("s") is True
+
+
+async def test_changed_since_after_restore_and_gc(env: DirEnv, trusting: None) -> None:
+    await env.provision()
+    await env.snapshot("a")
+    await _later()
+    (env.workdir / "x").write_text("x")
+    assert await env.changed_since("a") is True
+    await env.restore("a")
+    await _later()
+    assert await env.changed_since("a") is False
+    await env.gc(["other"])
+    assert await env.changed_since("a") is True  # forgotten
+    # A new instance (another process) has no fingerprints at all.
+    await env.snapshot("b")
+    other = DirEnv(env.template, env.job_dir.parent, "j1")
+    assert await other.changed_since("b") is True

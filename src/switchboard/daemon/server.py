@@ -44,6 +44,13 @@ External sink for the chaos harness: `sink_db` gives every job a persistent `SQL
 own SQLite file, so applications survive kill -9); `sink_naive` makes it non-idempotent. The
 extra `job_created` keys `effect_every`, `effect_policy` and (testing only) `exit_at_step` make
 the FakeAgent perform external effects / hard-exit the process.
+
+Observability (commit 20): the daemon owns a `LoopLagMonitor` (started in `start`, stopped in
+`_release`) whose p50/p99/max appear in `stats` ("loop_lag"), next to the store's write latency
+("store_latency") and queue depth. `debug_asyncio=True` (CLI `--debug-asyncio`) or the standard
+`PYTHONASYNCIODEBUG` turns on asyncio debug mode with `slow_callback_duration` = 50 ms, so a
+callback that blocks the loop is logged as "Executing <...> took N seconds". `on_token` is a
+TESTING-ONLY hook handed to every FakeAgent; a test makes it `time.sleep` to block the loop.
 """
 
 import asyncio
@@ -62,7 +69,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from switchboard.agents.fake import FakeAgent
+from switchboard.agents.fake import FakeAgent, TokenHook
 from switchboard.core import (
     Budget,
     Event,
@@ -94,6 +101,7 @@ from switchboard.daemon.protocol import (
 )
 from switchboard.env.base import Environment
 from switchboard.env.dir_env import DirEnv
+from switchboard.obs import LoopLagMonitor
 from switchboard.runtime.agent import Agent, ReplayPolicy
 from switchboard.runtime.recovery import RecoveryReport, recover
 from switchboard.runtime.sinks import SQLiteSink
@@ -117,6 +125,7 @@ MAX_SUBSCRIPTIONS_PER_CONNECTION = 64
 FLUSH_TIMEOUT_S = 2.0
 DEFAULT_SHUTDOWN_TIMEOUT_S = 10.0
 MAX_STEPS = 1_000_000
+SLOW_CALLBACK_S = 0.05  # asyncio debug mode: log callbacks that hold the loop longer than this
 
 type Result = dict[str, Any]
 
@@ -422,7 +431,15 @@ class Daemon:
         sink_db: str | Path | None = None,
         sink_naive: bool = False,
         verify_projection: bool | None = None,
+        debug_asyncio: bool = False,
+        lag_interval: float = 0.1,
+        on_token: TokenHook | None = None,
+        store_linger: float = 0.0,
     ) -> None:
+        self.store_linger = store_linger
+        self.debug_asyncio = debug_asyncio
+        self.on_token = on_token
+        self.lag = LoopLagMonitor(lag_interval)
         self.sink_db = Path(sink_db) if sink_db is not None else None
         self.sink_naive = sink_naive
         self.verify_projection = verify_projection
@@ -474,12 +491,21 @@ class Daemon:
         return self._bus
 
     # ---- lifecycle ----------------------------------------------------------------------
+    def _configure_debug(self) -> None:
+        loop = asyncio.get_running_loop()
+        if self.debug_asyncio:
+            loop.set_debug(True)
+        if self.debug_asyncio or (loop.get_debug() and os.environ.get("PYTHONASYNCIODEBUG")):
+            loop.slow_callback_duration = SLOW_CALLBACK_S
+
     async def start(self) -> None:
+        self._configure_debug()
         sock = await self._claim_socket()
         try:
+            self.lag.start()
             self.envs_dir.mkdir(parents=True, exist_ok=True)
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            self._store = await EventStore.open(self.db_path)
+            self._store = await EventStore.open(self.db_path, linger=self.store_linger)
             self._bus = EventBus(queue_size=self._bus_queue_size)
             self._store.add_listener(self._bus.publish)
             if self.sink_db is not None:
@@ -595,6 +621,7 @@ class Daemon:
         logger.info("shutdown complete")
 
     async def _release(self) -> None:
+        await self.lag.stop()
         if self._bus is not None:
             self._bus.close()
         if self._store is not None:
@@ -626,6 +653,7 @@ class Daemon:
             effect_every=spec.effect_every,
             effect_policy=ReplayPolicy(spec.effect_policy),
             exit_at_step=spec.exit_at_step,
+            on_token=self.on_token,
         )
 
     def _sink_factory(self, job: Job) -> SQLiteSink | None:
@@ -814,6 +842,9 @@ class Daemon:
             "jobs": by_state,
             "supervisor": dataclasses.asdict(self.supervisor.stats),
             "store": dataclasses.asdict(self.store.stats),
+            "store_latency": dataclasses.asdict(self.store.latency),
+            "loop_lag": dataclasses.asdict(self.lag.stats()),
+            "debug_asyncio": asyncio.get_running_loop().get_debug(),
             "bus": dataclasses.asdict(self.bus.stats),
             "recovery": (None if self.recovery is None else dataclasses.asdict(self.recovery)),
         }

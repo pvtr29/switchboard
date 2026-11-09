@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import logging
 import os
 import sys
 import time
@@ -21,6 +20,8 @@ from typing import Any
 
 from switchboard import __version__
 from switchboard.client.conn import Client, ClientError
+from switchboard.obs.logging import configure_logging
+from switchboard.obs.tuning import tune_gc
 
 DEFAULT_HOME = "~/.switchboard"
 ATTACH_STOP_STATES = frozenset({"verifying", "done", "failed", "cancelled"})
@@ -63,6 +64,30 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="on startup compare the jobs projection with a fold of the log "
         "(default: all jobs when there are at most 1000, else a sample of 100)",
+    )
+    d.add_argument("--log-format", choices=["json", "text"], default="text")
+    d.add_argument(
+        "--log-level",
+        choices=["debug", "info", "warning", "error"],
+        default="info",
+        type=str.lower,
+    )
+    d.add_argument(
+        "--debug-asyncio",
+        action="store_true",
+        help="asyncio debug mode: log callbacks that block the loop for more than 50 ms",
+    )
+    d.add_argument(
+        "--store-linger",
+        type=float,
+        default=0.002,
+        metavar="SECONDS",
+        help="under load, wait this long to group more appends per commit (0 = off)",
+    )
+    d.add_argument(
+        "--no-gc-tuning",
+        action="store_true",
+        help="keep CPython's default garbage collector thresholds",
     )
     d.add_argument("--sink-db", metavar="PATH", help="give jobs a persistent fake external sink")
     d.add_argument(
@@ -160,14 +185,54 @@ def format_job(j: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _flatten(d: dict[str, Any], prefix: str = "") -> list[str]:
-    out: list[str] = []
-    for k, v in d.items():
-        if isinstance(v, dict):
-            out.extend(_flatten(v, f"{prefix}{k}."))
-        else:
-            out.append(f"{prefix}{k}: {v}")
-    return out
+def _ms(seconds: float) -> str:
+    return f"{seconds * 1000:.2f}ms"
+
+
+def format_stats(st: dict[str, Any]) -> str:
+    """Operator view of the daemon's `stats` reply, as `key: value` lines."""
+    lines = [
+        f"pid: {st['pid']}",
+        f"uptime_s: {st['uptime_s']}",
+        f"connections: {st['connections']}",
+    ]
+    lines += [f"jobs.{state}: {n}" for state, n in sorted(st["jobs"].items())]
+    sup = st["supervisor"]
+    lines.append(
+        f"slots: running={sup['running']} waiting={sup['waiting']} "
+        f"max_running_seen={sup['max_running_seen']}"
+    )
+    lag = st.get("loop_lag")
+    if lag is not None:
+        lines.append(
+            f"loop_lag: p50={_ms(lag['p50_s'])} p99={_ms(lag['p99_s'])} max={_ms(lag['max_s'])} "
+            f"max_ever={_ms(lag['max_ever_s'])} samples={lag['samples']} "
+            f"(interval {_ms(lag['interval_s'])})"
+            + (" [asyncio debug on]" if st.get("debug_asyncio") else "")
+        )
+    lat = st.get("store_latency")
+    store = st["store"]
+    if lat is not None:
+        lines.append(
+            f"store_commit: p50={_ms(lat['commit_s']['p50'])} p99={_ms(lat['commit_s']['p99'])} "
+            f"batches={lat['commit_s']['count']} "
+            f"mean_batch_events={lat['batch_events']['mean']:.1f}"
+        )
+        lines.append(f"store_ack: p50={_ms(lat['ack_s']['p50'])} p99={_ms(lat['ack_s']['p99'])}")
+    lines.append(
+        f"store: events={store['events_written']} transactions={store['transactions']} "
+        f"queue_depth={store['queue_depth']} rejected_groups={store['rejected_groups']}"
+    )
+    bus = st["bus"]
+    lines.append(
+        f"bus: subscribers={bus['subscribers']} published={bus['published']} "
+        f"dropped={bus['dropped']} max_queue_depth={bus['max_queue_depth']}"
+    )
+    rec = st.get("recovery")
+    lines.append(
+        "recovery: none" if rec is None else "recovery: " + json.dumps(rec, sort_keys=True)
+    )
+    return "\n".join(lines)
 
 
 # ---- commands --------------------------------------------------------------------------------
@@ -237,7 +302,7 @@ async def _command(args: argparse.Namespace) -> int:
                 )
                 _say(f"{args.job}: {r['job']['state']}")
             case "stats":
-                _say("\n".join(_flatten(await c.request("stats"))))
+                _say(format_stats(await c.request("stats")))
             case "shutdown":
                 await c.request("shutdown")
                 _say("daemon shutting down")
@@ -247,11 +312,9 @@ async def _command(args: argparse.Namespace) -> int:
 def _run_daemon(args: argparse.Namespace) -> int:
     from switchboard.daemon.server import Daemon, DaemonError
 
-    logging.basicConfig(
-        level=logging.INFO,
-        stream=sys.stderr,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+    configure_logging(json=args.log_format == "json", level=args.log_level)
+    if not args.no_gc_tuning:
+        tune_gc()
     daemon = Daemon(
         socket_path=args.socket,
         db_path=args.db,
@@ -261,9 +324,11 @@ def _run_daemon(args: argparse.Namespace) -> int:
         sink_db=args.sink_db,
         sink_naive=args.sink_naive,
         verify_projection=args.verify_projection,
+        debug_asyncio=args.debug_asyncio,
+        store_linger=args.store_linger,
     )
     try:
-        asyncio.run(daemon.run())
+        asyncio.run(daemon.run(), debug=True if args.debug_asyncio else None)
     except DaemonError as exc:
         print(f"sb daemon: {exc}", file=sys.stderr)
         return EXIT_ERROR

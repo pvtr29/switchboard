@@ -149,10 +149,10 @@ def _project_effect(conn: sqlite3.Connection, e: Event) -> None:
 
 _EFFECT_EVENTS = frozenset({EventType.EFFECT_INTENT, EventType.EFFECT_OUTCOME})
 
-_Row = tuple[str, int, int | None, float, str, int, str]
+Row = tuple[str, int, int | None, float, str, int, str]
 
 
-def encode_event(e: Event) -> _Row:
+def encode_event(e: Event) -> Row:
     """Validate an event for appending and return its row tuple (without seq).
 
     Raises ValueError if seq is set, the payload version is from the future, or the payload is
@@ -223,18 +223,26 @@ def _row_to_job(row: tuple[Any, ...]) -> Job:
     )
 
 
+_set = object.__setattr__
+
+
 def _with_seq(e: Event, seq: int) -> Event:
-    # Much cheaper than dataclasses.replace on this hot path.
-    return Event(
-        seq=seq,
-        job_id=e.job_id,
-        epoch=e.epoch,
-        step_id=e.step_id,
-        ts=e.ts,
-        type=e.type,
-        v=e.v,
-        payload=e.payload,
-    )
+    """Copy of an already validated event with `seq` set.
+
+    Skips Event.__post_init__ (validation and the payload copy were done when `e` was built and
+    the payload is already an immutable view), which made this the top allocation on the commit
+    path: it runs for every inserted event, twice.
+    """
+    new = object.__new__(Event)
+    _set(new, "seq", seq)
+    _set(new, "job_id", e.job_id)
+    _set(new, "epoch", e.epoch)
+    _set(new, "step_id", e.step_id)
+    _set(new, "ts", e.ts)
+    _set(new, "type", e.type)
+    _set(new, "v", e.v)
+    _set(new, "payload", e.payload)
+    return new
 
 
 class SQLiteEventLog:
@@ -253,6 +261,9 @@ class SQLiteEventLog:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
         self._cache: dict[str, Job] = {}
+        self.last_changed: dict[str, Job] = {}
+        """Projections written by the most recent `append_encoded` (empty after a failure). The
+        async store mirrors them in memory; read it on the thread that made the call."""
 
     def append_many(self, events: Sequence[Event]) -> list[AppendResult]:
         """Append one group atomically (see `append_groups`); raises if it is rejected."""
@@ -278,11 +289,22 @@ class SQLiteEventLog:
         the write lock, so the in-memory view cannot go stale, and a rejected group's changes
         are only merged into the view after it succeeded.
         """
-        encoded = [[encode_event(e) for e in g] for g in groups]
+        return self.append_encoded(groups, [[encode_event(e) for e in g] for g in groups])
+
+    def append_encoded(
+        self, groups: Sequence[Sequence[Event]], encoded: Sequence[Sequence[Row]]
+    ) -> list[GroupResult]:
+        """`append_groups` for groups the caller already ran through `encode_event`.
+
+        `encoded[i][j]` must be `encode_event(groups[i][j])`. The async writer encodes once, in
+        the caller's task (so a bad event fails only its own caller), and passes the rows here
+        instead of encoding every event a second time on the writer thread.
+        """
         if not any(encoded):
             return [[] for _ in groups]
 
         conn = self._conn
+        self.last_changed = {}
         outcomes: list[GroupResult] = []
         pending: dict[str, Job] = {}  # committed-by-savepoint, not yet by the transaction
         conn.execute("BEGIN IMMEDIATE")
@@ -333,6 +355,7 @@ class SQLiteEventLog:
                 conn.execute("ROLLBACK")
             raise
         self._cache.update(pending)
+        self.last_changed = pending
         return outcomes
 
     def _lookup(self, pending: dict[str, Job], job_id: str) -> Job | None:

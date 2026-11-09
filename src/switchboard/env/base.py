@@ -7,7 +7,7 @@ An `env_ref` is an opaque string the environment hands out and later accepts bac
 
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 
 class SnapshotMissing(Exception):
@@ -44,4 +44,19 @@ class Environment(Protocol):
 
     async def destroy(self) -> None:
         """Remove the workdir and all snapshots."""
+        ...
+
+
+@runtime_checkable
+class ChangeDetectingEnvironment(Environment, Protocol):
+    """An environment that can tell cheaply that a step left the workdir untouched.
+
+    The runner asks before snapshotting S(n+1): when `changed_since(ref)` is False, S(n+1) equals
+    the snapshot `ref` of S(n) and the runner reuses `ref` instead of taking another snapshot
+    (a snapshot costs a full copy; the check costs a metadata scan).
+    """
+
+    async def changed_since(self, env_ref: str) -> bool:
+        """False only when the workdir is PROVABLY identical to snapshot `env_ref`. Any doubt
+        (unknown ref, missing snapshot, timestamps too fresh to trust) must answer True."""
         ...

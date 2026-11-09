@@ -17,12 +17,11 @@ JSON conventions for Budget/Usage: `budget_to_dict` omits unlimited (None) dimen
 writes all three keys.
 """
 
-import dataclasses
 from collections.abc import Iterable, Mapping
 from typing import Any
 
 from switchboard.core.models import Budget, Event, EventType, Job, JobKind, Usage, Verdict
-from switchboard.core.states import TERMINAL_STATES, IllegalTransition, JobState
+from switchboard.core.states import TERMINAL_STATES, IllegalTransition, JobState, transition
 
 
 class ProjectionError(ValueError):
@@ -144,7 +143,7 @@ def apply(job: Job | None, event: Event) -> Job:
                     f"{_where(event)}: from={src.value} but job is {job.state.value}"
                 )
             try:
-                job.with_state(dst, at=event.ts)
+                transition(job.state, dst)  # validates the edge; the copy is made below
             except IllegalTransition as exc:
                 raise ProjectionError(f"{_where(event)}: {exc}") from exc
             changes["state"] = dst
@@ -200,7 +199,32 @@ def apply(job: Job | None, event: Event) -> Job:
             changes.update(owner=None, lease_until=None)
         case _:
             pass  # budget_*, effect_*: journal-only for the projection
-    return dataclasses.replace(job, last_seq=event.seq, updated_at=event.ts, **changes)
+    return _replaced(job, event.seq, event.ts, changes)
+
+
+def _replaced(job: Job, last_seq: int, updated_at: float, changes: dict[str, Any]) -> Job:
+    """`dataclasses.replace(job, last_seq=..., updated_at=..., **changes)`, about 2x faster.
+
+    It runs once per folded event, i.e. on the store writer's hot path.
+    """
+    fields: dict[str, Any] = {
+        "job_id": job.job_id,
+        "kind": job.kind,
+        "task_ref": job.task_ref,
+        "state": job.state,
+        "verdict": job.verdict,
+        "budget": job.budget,
+        "usage": job.usage,
+        "owner": job.owner,
+        "lease_until": job.lease_until,
+        "epoch": job.epoch,
+        "last_step": job.last_step,
+        "last_seq": last_seq,
+        "created_at": job.created_at,
+        "updated_at": updated_at,
+    }
+    fields.update(changes)
+    return Job(**fields)
 
 
 def _created(e: Event) -> Job:

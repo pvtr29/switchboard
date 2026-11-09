@@ -6,6 +6,7 @@ from conftest import create_job
 
 from switchboard.agents.fake import FakeAgent
 from switchboard.core import Event, EventType, JobState
+from switchboard.env import dir_env
 from switchboard.env.dir_env import DirEnv
 from switchboard.runtime.agent import ActResult, ModelResponse, StepContext
 from switchboard.runtime.runner import run_job
@@ -248,3 +249,132 @@ async def test_crash_during_provisioning_is_retried(
     job = await run_job(store, "j1", FakeAgent(steps=STEPS), env=env)
     assert job.state is JobState.VERIFYING
     assert await env.hash() == ctl
+
+
+# ---- skip-unchanged snapshots ----------------------------------------------------------------
+
+
+class SparseWriter(FakeAgent):
+    """Writes a NEW file on the steps in `write_on`; every other step only reads (and the tool
+    calls of the fake model touch nothing)."""
+
+    def __init__(self, write_on: set[int], steps: int = 6, crash_step: int | None = None) -> None:
+        super().__init__(steps=steps)
+        self.write_on = write_on
+        self.crash_step = crash_step
+
+    async def act(self, ctx: StepContext, response: ModelResponse) -> ActResult:
+        if ctx.step == self.crash_step and ctx.attempt == 0:
+            raise Crash
+        assert ctx.workdir is not None
+        (ctx.workdir / "README").read_text()
+        if ctx.step in self.write_on:
+            (ctx.workdir / f"out{ctx.step}.txt").write_text(f"step {ctx.step}\n")
+        return ActResult(messages=(), done=ctx.step + 1 >= self.steps, summary="s")
+
+
+@pytest.fixture
+def trusting(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(dir_env, "RACY_NS", 0)  # trust fingerprints at once (see test_dir_env)
+
+
+def refs_of(events: list[Event]) -> list[str]:
+    return [e.payload["env_ref"] for e in by_type(events, T.STEP_COMPLETED)]
+
+
+async def sparse_control_hash(template: Path, root: Path, write_on: set[int]) -> str:
+    env = make_env(template, root / "control", "ctl")
+    async with await EventStore.open(root / "control.db") as s:
+        await create_job(s, job_id="ctl", seed=SEED)
+        await run_job(s, "ctl", SparseWriter(write_on), env=env)
+    return await env.hash()
+
+
+async def test_read_only_steps_reuse_the_ref(
+    store: EventStore, template: Path, tmp_path: Path, trusting: None
+) -> None:
+    env = make_env(template, tmp_path / "envs")
+    await create_job(store, seed=SEED)
+    job = await run_job(store, "j1", SparseWriter(set()), env=env)
+    assert job.state is JobState.VERIFYING
+    assert refs_of(await store.read_job("j1")) == ["initial"] * 6
+    assert await env.snapshots() == ["initial"]  # not a single extra snapshot
+
+
+async def test_changed_steps_snapshot_and_unchanged_reuse(
+    store: EventStore, template: Path, tmp_path: Path, trusting: None
+) -> None:
+    write_on = {0, 3}
+    ctl = await sparse_control_hash(template, tmp_path, write_on)
+    env = make_env(template, tmp_path / "envs")
+    await create_job(store, seed=SEED)
+    await run_job(store, "j1", SparseWriter(write_on), env=env)
+    # step 0 writes -> new snapshot; 1, 2 read only -> reuse it; 3 writes -> new; 4, 5 reuse
+    assert refs_of(await store.read_job("j1")) == ["s1-a0"] * 3 + ["s4-a0"] * 3
+    assert await env.hash() == ctl
+    assert await env.snapshots() == ["initial", "s1-a0", "s4-a0"]
+
+
+async def test_untrusted_fingerprint_always_snapshots(
+    store: EventStore, template: Path, tmp_path: Path
+) -> None:
+    """Default racy window: the fast test's files are too fresh to trust, so nothing is skipped
+    and the behaviour is exactly the old one."""
+    env = make_env(template, tmp_path / "envs")
+    await create_job(store, seed=SEED)
+    await run_job(store, "j1", SparseWriter(set(), steps=3), env=env)
+    assert refs_of(await store.read_job("j1")) == ["s1-a0", "s2-a0", "s3-a0"]
+
+
+async def test_env_without_change_detection_snapshots_every_step(
+    store: EventStore, template: Path, tmp_path: Path, trusting: None
+) -> None:
+    inner = make_env(template, tmp_path / "envs")
+
+    class Plain:
+        """Only the base Environment protocol: no changed_since."""
+
+        workdir = inner.workdir
+        provision = inner.provision
+        snapshot = inner.snapshot
+        restore = inner.restore
+        hash = inner.hash
+        gc = inner.gc
+        destroy = inner.destroy
+
+    await create_job(store, seed=SEED)
+    await run_job(store, "j1", SparseWriter(set(), steps=3), env=Plain())
+    assert refs_of(await store.read_job("j1")) == ["s1-a0", "s2-a0", "s3-a0"]
+
+
+@pytest.mark.parametrize("crash_step", [1, 2, 4])
+async def test_recovery_after_reused_refs_is_correct(
+    crash_step: int, store: EventStore, template: Path, tmp_path: Path, trusting: None
+) -> None:
+    write_on = {0, 3}
+    ctl = await sparse_control_hash(template, tmp_path, write_on)
+    await create_job(store, seed=SEED)
+    with pytest.raises(Crash):
+        await run_job(
+            store,
+            "j1",
+            SparseWriter(write_on, crash_step=crash_step),
+            env=make_env(template, tmp_path / "envs"),
+        )
+    env2 = make_env(template, tmp_path / "envs")  # a new process: no fingerprints
+    job = await run_job(store, "j1", SparseWriter(write_on), env=env2)
+    assert job.state is JobState.VERIFYING
+    assert await env2.hash() == ctl
+    events = await store.read_job("j1")
+    (restored,) = by_type(events, T.RESTORED)
+    expected_ref = {1: "s1-a0", 2: "s1-a0", 4: "s4-a0"}[crash_step]  # S(crash_step)
+    assert restored.payload["env_ref"] == expected_ref  # the reused ref, and it still exists
+
+
+async def test_keep_last_zero_never_reuses(
+    store: EventStore, template: Path, tmp_path: Path, trusting: None
+) -> None:
+    env = make_env(template, tmp_path / "envs")
+    await create_job(store, seed=SEED)
+    await run_job(store, "j1", SparseWriter(set(), steps=3), env=env, keep_last=0)
+    assert refs_of(await store.read_job("j1")) == ["s1-a0", "s2-a0", "s3-a0"]

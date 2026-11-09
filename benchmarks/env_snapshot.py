@@ -52,6 +52,22 @@ async def measure(env: DirEnv, iterations: int) -> tuple[list[float], list[float
     return snaps, restores
 
 
+async def measure_skip(env: DirEnv, iterations: int) -> tuple[list[float], list[float]]:
+    """Cost of proving "unchanged" (`changed_since`) next to the snapshot it replaces."""
+    await env.provision()
+    snaps: list[float] = []
+    checks: list[float] = []
+    for i in range(iterations):
+        t = time.perf_counter()
+        await env.snapshot(f"k{i}")
+        snaps.append((time.perf_counter() - t) * 1000)
+        await asyncio.sleep(0.01)
+        t = time.perf_counter()
+        assert await env.changed_since(f"k{i}") is False
+        checks.append((time.perf_counter() - t) * 1000)
+    return snaps, checks
+
+
 async def main(iterations: int) -> None:
     rows: list[str] = []
     with tempfile.TemporaryDirectory(prefix="sb-bench-") as tmp:
@@ -84,6 +100,26 @@ async def main(iterations: int) -> None:
         f"{'restore p50':>13}{'p99':>10}  (ms)"
     )
     print("\n".join(rows))
+    print()
+    print(
+        "skip-unchanged snapshots: a step that changed nothing pays changed_since, not a snapshot"
+    )
+    print(f"{'case':<15}{'snapshot p50':>14}{'check p50':>12}{'check p99':>11}{'saved/step':>12}")
+    dir_env.RACY_NS = 0  # fresh template files are older than the scan only after a moment
+    with tempfile.TemporaryDirectory(prefix="sb-bench-") as tmp:
+        root = Path(tmp)
+        for label, files, size in CASES[:3]:
+            template = root / f"t-{files}-{size}"
+            template.mkdir()
+            await asyncio.to_thread(build_template, template, files, size)
+            env = DirEnv(template, root / "envs", f"k-{files}")
+            snaps, checks = await measure_skip(env, max(5, iterations // 2))
+            s50, c50 = statistics.median(snaps), statistics.median(checks)
+            print(
+                f"{label:<15}{s50:>14.1f}{c50:>12.1f}{pct(checks, 0.99):>11.1f}"
+                f"{(1 - c50 / s50) * 100:>11.0f}%"
+            )
+            await env.destroy()
 
 
 if __name__ == "__main__":
