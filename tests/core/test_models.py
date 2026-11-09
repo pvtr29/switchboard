@@ -25,7 +25,7 @@ def test_enum_values() -> None:
     assert Verdict.PASS_.value == "pass"
     assert {v.value for v in Verdict} == {"pass", "fail", "suspected_hack"}
     assert {k.value for k in JobKind} == {"fake", "rollout"}
-    assert len(EventType) == 15
+    assert len(EventType) == 16
     assert EventType.STEP_COMPLETED.value == "step_completed"
 
 

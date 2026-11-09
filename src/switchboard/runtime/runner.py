@@ -28,12 +28,40 @@ reason "agent error: ...") and `run_job` RETURNS the failed job instead of raisi
 supervisor needs no exception handling to learn the outcome. CancelledError and other
 BaseExceptions propagate untouched. Store errors propagate.
 
+Budgets and active time (docs/plan.md "Budgets"):
+
+- Active time is measured with the event loop clock (`loop.time()`, so looptime tests work)
+  from just after the boundary checks to the commit: restore, step_started, sample, act,
+  snapshot. It lands in the log exactly once: sample time in the sample group's
+  usage_recorded, act + snapshot time as `active_seconds` in the `step_completed` payload (the
+  projection adds it; atomic with the commit, no extra event). A step that fails or is
+  preempted records the unrecorded remainder in a usage_recorded in the same group as the
+  state change. A step cancelled by the user (or a shutdown) loses its unrecorded time.
+  Queued, paused and daemon-down time is never measured. The agent's own
+  `Usage.active_seconds` is ignored: the runtime's measurement is the record.
+- Boundary check (before step_started): an exhausted dimension moves running -> over_budget
+  (reason "budget exhausted: <dimension>"); at >= 80% one `budget_warning` per (dimension,
+  limit) is appended, deduplicated against the log, so it survives restarts and re-arms when
+  an extension changes the limit.
+- Hard preemption: sample and act (+ snapshot) each run under `asyncio.timeout` whose deadline
+  is `origin + active limit + grace`, origin being the loop time at which recorded active
+  usage was zero (recomputed from the projection every step: never from in-memory state).
+  The store appends between the scopes are deliberately outside them so a preemption never
+  lands in the middle of a group. On expiry nothing more of the step is committed (the logged
+  llm_responded, if any, stays; the re-run act reuses it) and running -> over_budget with
+  reason "active_seconds (preempted)" is recorded together with the wasted active seconds.
+  Every attempt counts towards `max_attempts_per_step`.
+- Tokens/usd: with a `BudgetManager`, each sample is preceded by a reservation (see
+  budget.py); denial moves the job to over_budget before sampling.
+
 Usage payload choice: `Usage` has one `tokens` total, so usage_recorded gets
 tokens_in=usage.tokens and tokens_out=0 (the projection sums both). The full usage is also
 stored in llm_responded so a logged response decodes losslessly. A duplicate llm_responded
 still records its usage_recorded: wasted sampling is counted, not hidden.
 """
 
+import asyncio
+import dataclasses
 import random
 import time
 from collections import Counter
@@ -59,6 +87,14 @@ from switchboard.runtime.agent import (
     StepContext,
     ToolCall,
 )
+from switchboard.runtime.budget import (
+    DEFAULT_GRACE_S,
+    BudgetManager,
+    DeadlineWatch,
+    Reservation,
+    ReservationDenied,
+    TokenBucket,
+)
 from switchboard.runtime.effects import EffectJournal, ExternalSink
 from switchboard.store import AppendStatus, EventStore
 
@@ -66,6 +102,7 @@ REASON_CONFIG_CHANGED = "config changed"
 REASON_RESTART_LIMIT = "restart limit"
 REASON_SNAPSHOT_MISSING = "snapshot missing"
 INITIAL_SNAPSHOT = "initial"
+PREEMPTED = "active_seconds (preempted)"
 
 
 class JobNotRunnable(RuntimeError):
@@ -82,6 +119,7 @@ class _LogView:
         self.started: Counter[int] = Counter()
         self.initial_ref: str | None = None
         self.ran = False  # the job has been in `running` at least once (see run_job)
+        self.warned: set[tuple[str, float]] = set()  # (dimension, limit) already warned about
         for e in events:
             match e.type:
                 case EventType.JOB_CREATED:
@@ -100,6 +138,8 @@ class _LogView:
                 case EventType.STEP_STARTED:
                     assert e.step_id is not None
                     self.started[e.step_id] += 1
+                case EventType.BUDGET_WARNING:
+                    self.warned.add((str(e.payload["dimension"]), float(e.payload["limit"])))
                 case _:
                     pass
         if self.created is None:
@@ -182,6 +222,10 @@ async def run_job(
     keep_last: int = 2,
     should_pause: Callable[[], bool] | None = None,
     sink: ExternalSink | None = None,
+    budget: BudgetManager | None = None,
+    rate_limiter: TokenBucket | None = None,
+    grace_s: float = DEFAULT_GRACE_S,
+    watch: DeadlineWatch | None = None,
 ) -> Job:
     """Run `job_id` until it is verifying, failed, or no longer ours; return its projection.
 
@@ -200,6 +244,11 @@ async def run_job(
     `sink` enables `ctx.effect`: each step attempt gets an `EffectJournal` over it (see
     runtime/effects.py). Effects are reconciled lazily, when the re-run act phase reaches the
     same `ctx.effect` call; restoring S(n) does not undo them.
+
+    Budgets (see module docstring): `budget` enables token/usd reservation (and the granted
+    output cap in `ctx.max_output_tokens`), `rate_limiter` is awaited before each sample,
+    `grace_s` is the hard-preemption grace, `watch` lets the supervisor move a running step's
+    deadline after an extension. Active time is always enforced.
     """
     job = await store.get_job(job_id)
     if job is None:
@@ -217,8 +266,41 @@ async def run_job(
             EventType.STATE_CHANGED, {"from": src.value, "to": dst.value, "reason": reason}
         )
 
+    loop = asyncio.get_running_loop()
+    watch = watch if watch is not None else DeadlineWatch(grace_s)
+    watch.grace_s = grace_s
+    mark: float | None = None  # loop time up to which active seconds are recorded in the log
+
+    def take_active() -> float:
+        """Active seconds since `mark`, advancing it: the caller MUST append them."""
+        nonlocal mark
+        now = loop.time()
+        spent = 0.0 if mark is None else max(now - mark, 0.0)
+        mark = now
+        return spent
+
+    def active_events() -> list[Event]:
+        """A usage_recorded for the unrecorded active seconds of an unfinished step."""
+        if mark is None:
+            return []
+        spent = take_active()
+        return [
+            event(EventType.USAGE_RECORDED, {"active_seconds": spent, "reason": "step aborted"})
+        ]
+
     async def fail(reason: str) -> Job:
-        await store.append_group([state_change(JobState.RUNNING, JobState.FAILED, reason)])
+        await store.append_group(
+            [*active_events(), state_change(JobState.RUNNING, JobState.FAILED, reason)]
+        )
+        return await _current()
+
+    async def over_budget(reason: str, *, record_active: bool) -> Job:
+        await store.append_group(
+            [
+                *(active_events() if record_active else []),
+                state_change(JobState.RUNNING, JobState.OVER_BUDGET, reason),
+            ]
+        )
         return await _current()
 
     async def _current() -> Job:
@@ -272,6 +354,9 @@ async def run_job(
 
     while True:
         job = await _current()
+        # Set synchronously after the read: an extension landing later calls limit_changed.
+        watch.limit = job.budget.active_seconds
+        mark = None  # nothing of this step is unrecorded yet
         if job.state is not JobState.RUNNING:
             return job  # finished, failed or cancelled by someone else
         if should_pause is not None and should_pause():
@@ -281,10 +366,35 @@ async def run_job(
                 [state_change(JobState.RUNNING, JobState.PAUSED, "paused by user")]
             )
             return await _current()
+        # Budget boundary (cooperative level). warnings() excludes exhausted dimensions, so a
+        # boundary either warns or stops, never both.
+        exhausted = job.budget.exhausted(job.usage)
+        if exhausted:
+            return await over_budget(f"budget exhausted: {exhausted[0].value}", record_active=False)
+        warnings = [
+            event(
+                EventType.BUDGET_WARNING,
+                {
+                    "dimension": d.value,
+                    "used": job.usage.get(d),
+                    "limit": lim,
+                    "threshold": 0.8,
+                },
+            )
+            for d in job.budget.warnings(job.usage)
+            if (lim := job.budget.limit(d)) is not None and (d.value, lim) not in log.warned
+        ]
+        if warnings:
+            await store.append_group(warnings)
+            log.warned.update(
+                (str(w.payload["dimension"]), float(w.payload["limit"])) for w in warnings
+            )
         n = log.next_step
         attempt = log.started[n]
         if attempt >= max_attempts_per_step:
             return await fail(REASON_RESTART_LIMIT)
+        mark = loop.time()
+        watch.origin = mark - job.usage.active_seconds
         if env is not None and needs_restore:
             needs_restore = False
             ref = log.ref_before(n)
@@ -323,10 +433,51 @@ async def run_job(
         if logged is not None:
             response = _decode_response(logged)
         else:
+            reservation: Reservation | None = None
+            if budget is not None:
+                try:
+                    reservation = budget.reserve(
+                        job,
+                        agent.estimate_input_tokens(history),
+                        agent.max_output_tokens,
+                        agent.pricing,
+                    )
+                except ReservationDenied as denied:
+                    return await over_budget(
+                        f"budget exhausted: {denied.dimension.value} ({denied.scope})",
+                        record_active=True,
+                    )
+                ctx = dataclasses.replace(ctx, max_output_tokens=reservation.max_output_tokens)
+            sample_error: Exception | None = None
             try:
-                response = await agent.sample(ctx, tuple(history))
-            except Exception as exc:
-                return await fail(f"agent error: {type(exc).__name__}: {exc}")
+                async with asyncio.timeout(None) as cm:
+                    watch.arm(cm)
+                    try:
+                        if rate_limiter is not None and reservation is not None:
+                            await rate_limiter.acquire(
+                                min(reservation.tokens, rate_limiter.capacity)
+                            )
+                        response = await agent.sample(ctx, tuple(history))
+                    except Exception as exc:
+                        sample_error = exc
+            except TimeoutError:
+                if budget is not None and reservation is not None:
+                    budget.release(reservation)
+                if cm.expired():
+                    return await over_budget(PREEMPTED, record_active=True)
+                raise
+            except BaseException:
+                if budget is not None and reservation is not None:
+                    budget.release(reservation)
+                raise
+            finally:
+                watch.disarm()
+            if sample_error is not None:
+                if budget is not None and reservation is not None:
+                    budget.release(reservation)
+                return await fail(f"agent error: {type(sample_error).__name__}: {sample_error}")
+            if budget is not None and reservation is not None:
+                budget.settle(reservation, response.usage)
             results = await store.append_group(
                 [
                     event(
@@ -354,7 +505,8 @@ async def run_job(
                             "tokens_in": response.usage.tokens,
                             "tokens_out": 0,
                             "usd_micros": response.usage.usd_micros,
-                            "active_seconds": response.usage.active_seconds,
+                            # Measured, not the agent's claim: the sample phase's active time.
+                            "active_seconds": take_active(),
                             "model": response.model,
                         },
                     ),
@@ -365,16 +517,29 @@ async def run_job(
                 log = _LogView(await store.read_job(job_id))
                 response = _decode_response(log.responded[n])
 
-        # ---- act phase -------------------------------------------------------------------
+        # ---- act phase (+ snapshot): inside the preemption scope -----------------------------
+        act_error: Exception | None = None
+        env_ref: str | None = None
         try:
-            result: ActResult = await agent.act(ctx, response)
-        except Exception as exc:
-            return await fail(f"agent error: {type(exc).__name__}: {exc}")
+            async with asyncio.timeout(None) as cm:
+                watch.arm(cm)
+                try:
+                    result: ActResult = await agent.act(ctx, response)
+                except Exception as exc:
+                    act_error = exc
+                else:
+                    if env is not None:
+                        env_ref = await env.snapshot(f"s{n + 1}-a{attempt}")
+        except TimeoutError:
+            if cm.expired():
+                return await over_budget(PREEMPTED, record_active=True)
+            raise
+        finally:
+            watch.disarm()
+        if act_error is not None:
+            return await fail(f"agent error: {type(act_error).__name__}: {act_error}")
 
         # ---- commit -----------------------------------------------------------------------
-        env_ref: str | None = None
-        if env is not None:
-            env_ref = await env.snapshot(f"s{n + 1}-a{attempt}")
         delta: list[Message] = [response.message, *result.messages]
         group = [
             event(
@@ -385,6 +550,8 @@ async def run_job(
                     "summary": result.summary,
                     "config_hash": agent.config_hash,
                     "env_ref": env_ref,
+                    # Act + commit time rides in the commit itself: atomic, no extra event.
+                    "active_seconds": take_active(),
                 },
                 n,
             )

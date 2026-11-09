@@ -53,7 +53,9 @@ async def test_happy_path(store: EventStore) -> None:
         total = total + Usage(
             tokens=e.payload["usage"]["tokens"], usd_micros=e.payload["usage"]["usd_micros"]
         )
-    assert job.usage == total
+    assert job.usage.tokens == total.tokens
+    assert job.usage.usd_micros == total.usd_micros
+    assert job.usage.active_seconds > 0  # measured by the runner (virtual token sleeps)
     states = [(e.payload["from"], e.payload["to"]) for e in by_type(events, T.STATE_CHANGED)]
     assert states == [
         ("queued", "provisioning"),

@@ -7,6 +7,9 @@ over the full log, so live projection and rebuilt projection agree by constructi
 Strictness: payloads are decoded with explicit type checks and a wrong or missing field raises
 ProjectionError naming the event. Illegal state moves are also reported as ProjectionError (the
 original IllegalTransition is chained as `__cause__`), so callers need to catch only one type.
+`step_completed` may carry `active_seconds` (act + commit time), added to usage.
+`budget_extended` adds its deltas to the job's limits (unlimited stays unlimited) and is legal
+in any non-terminal state.
 Unknown extra payload keys are ignored (payloads may grow within a version).
 
 JSON conventions for Budget/Usage: `budget_to_dict` omits unlimited (None) dimensions, and
@@ -19,7 +22,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 from switchboard.core.models import Budget, Event, EventType, Job, JobKind, Usage, Verdict
-from switchboard.core.states import IllegalTransition, JobState
+from switchboard.core.states import TERMINAL_STATES, IllegalTransition, JobState
 
 
 class ProjectionError(ValueError):
@@ -167,6 +170,25 @@ def apply(job: Job | None, event: Event) -> Job:
             changes["verdict"] = verdict
         case EventType.STEP_COMPLETED:
             changes["last_step"] = event.step_id
+            # Active seconds of the act/commit portion of the step ride in the commit itself,
+            # so they are recorded atomically with it. Absent in older logs: counts as 0.
+            secs = event.payload.get("active_seconds", 0.0)
+            if not _is_num(secs) or secs < 0:
+                raise ProjectionError(f"{_where(event)}: payload.active_seconds invalid: {secs!r}")
+            if secs:
+                changes["usage"] = job.usage + Usage(active_seconds=float(secs))
+        case EventType.BUDGET_EXTENDED:
+            if job.state in TERMINAL_STATES:
+                raise ProjectionError(f"{_where(event)}: cannot extend a {job.state.value} job")
+            by = event.payload
+            secs = by.get("active_seconds", 0.0)
+            if not _is_num(secs) or secs < 0:
+                raise ProjectionError(f"{_where(event)}: payload.active_seconds invalid: {secs!r}")
+            changes["budget"] = job.budget.extended(
+                active_seconds=float(secs),
+                tokens=_int_default(event, "tokens"),
+                usd_micros=_int_default(event, "usd_micros"),
+            )
         case EventType.LEASE_ACQUIRED:
             lease_until = event.payload.get("lease_until")
             if not isinstance(lease_until, int | float) or isinstance(lease_until, bool):

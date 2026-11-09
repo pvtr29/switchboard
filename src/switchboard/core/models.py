@@ -33,6 +33,7 @@ class EventType(StrEnum):
     BUDGET_RESERVED = "budget_reserved"
     BUDGET_SETTLED = "budget_settled"
     BUDGET_WARNING = "budget_warning"
+    BUDGET_EXTENDED = "budget_extended"
     EFFECT_INTENT = "effect_intent"
     EFFECT_OUTCOME = "effect_outcome"
     LEASE_ACQUIRED = "lease_acquired"
@@ -120,6 +121,18 @@ class Budget:
                 return self.tokens
             case Dimension.USD_MICROS:
                 return self.usd_micros
+
+    def extended(
+        self, *, active_seconds: float = 0.0, tokens: int = 0, usd_micros: int = 0
+    ) -> "Budget":
+        """A copy with the limits raised; an unlimited dimension stays unlimited."""
+        _check_non_negative(active_seconds=active_seconds, tokens=tokens, usd_micros=usd_micros)
+        secs, tok, usd = self.active_seconds, self.tokens, self.usd_micros
+        return Budget(
+            active_seconds=None if secs is None else secs + active_seconds,
+            tokens=None if tok is None else tok + tokens,
+            usd_micros=None if usd is None else usd + usd_micros,
+        )
 
     def remaining(self, usage: Usage) -> Remaining:
         # Written per field so int dimensions stay int and float stays float.

@@ -18,6 +18,7 @@ from switchboard.runtime.agent import (
     EffectResult,
     Message,
     ModelResponse,
+    Pricing,
     ReplayPolicy,
     StepContext,
     ToolCall,
@@ -27,6 +28,7 @@ from switchboard.runtime.effects import ExternalSink, effect_key
 
 PROMPT_TOKENS = 50
 USD_MICROS_PER_TOKEN = 3
+MAX_OUTPUT_TOKENS = 8  # the most tokens FakeModel streams per call
 
 TOOLS: tuple[ToolSpec, ...] = (
     ToolSpec("add", ReplayPolicy.SAFE),
@@ -88,6 +90,9 @@ class FakeModel:
     async def sample(self, ctx: StepContext, history: Sequence[Message]) -> ModelResponse:
         rng = ctx.rng
         k = rng.randint(3, 8)
+        if ctx.max_output_tokens is not None:
+            # Drawn first, capped after, so the rng stream is the same with or without a cap.
+            k = min(k, ctx.max_output_tokens)
         tokens: list[str] = []
         for i in range(k):
             await asyncio.sleep(self.token_interval)
@@ -160,8 +165,13 @@ class FakeAgent:
                 sort_keys=True,
             ).encode()
         ).hexdigest()
+        self.max_output_tokens = MAX_OUTPUT_TOKENS
+        self.pricing = Pricing(USD_MICROS_PER_TOKEN, USD_MICROS_PER_TOKEN)
         self.sample_calls: list[tuple[int, int]] = []
         self.act_calls: list[tuple[int, int]] = []
+
+    def estimate_input_tokens(self, history: Sequence[Message]) -> int:
+        return PROMPT_TOKENS  # the fake model always bills exactly this much input
 
     async def sample(self, ctx: StepContext, history: Sequence[Message]) -> ModelResponse:
         self.sample_calls.append((ctx.step, ctx.attempt))

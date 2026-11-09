@@ -41,6 +41,12 @@ without running a step (there is no legal queued -> paused edge). `resume()` bef
 cancels the pending pause. Pausing a job without a live task raises NotPausable. `pause()`
 returns as soon as the request is recorded; `wait(job_id)` returns once the task ended.
 
+Budgets: `Supervisor` owns one `BudgetManager` shared by all its jobs (global token/usd caps,
+`global_budget=`) and an optional shared `TokenBucket` (`rate_limiter=`); its global usage is
+initialised lazily, under a lock, from the store (the first job task to run does it, because
+that read spans an await; see budget.py). `extend()` appends `budget_extended`; an over_budget
+job is re-queued and re-admitted, a running job's step deadline is moved via `DeadlineWatch`.
+
 `wait(job_id)` returns None once the job's task has finished and never re-raises what the task
 raised; use `outcome(job_id)` for the Job, the exception, or the cancelled flag.
 """
@@ -52,9 +58,24 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
-from switchboard.core import TERMINAL_STATES, Event, EventType, Job, JobState, ProjectionError
+from switchboard.core import (
+    TERMINAL_STATES,
+    Budget,
+    Event,
+    EventType,
+    Job,
+    JobState,
+    ProjectionError,
+)
 from switchboard.env.base import Environment
 from switchboard.runtime.agent import Agent
+from switchboard.runtime.budget import (
+    DEFAULT_GRACE_S,
+    DEFAULT_MIN_OUTPUT_TOKENS,
+    BudgetManager,
+    DeadlineWatch,
+    TokenBucket,
+)
 from switchboard.runtime.effects import ExternalSink
 from switchboard.runtime.runner import JobNotRunnable, run_job
 from switchboard.runtime.slots import SlotPool
@@ -81,6 +102,10 @@ class NotCancellable(RuntimeError):
 
 class NotPausable(RuntimeError):
     """`pause` was called for a job that is not queued or running under this supervisor."""
+
+
+class NotExtendable(RuntimeError):
+    """`extend` was called for a job that already finished (done, failed or cancelled)."""
 
 
 class NotResumable(RuntimeError):
@@ -117,7 +142,18 @@ class Supervisor:
         *,
         clock: Callable[[], float] = time.time,
         max_running: int = 8,
+        global_budget: Budget | None = None,
+        rate_limiter: TokenBucket | None = None,
+        grace_s: float = DEFAULT_GRACE_S,
+        min_output_tokens: int = DEFAULT_MIN_OUTPUT_TOKENS,
     ) -> None:
+        self._global_budget = global_budget
+        self._rate_limiter = rate_limiter
+        self._grace_s = grace_s
+        self._min_output_tokens = min_output_tokens
+        self._budget: BudgetManager | None = None
+        self._budget_lock = asyncio.Lock()
+        self._watches: dict[str, DeadlineWatch] = {}
         self._pool = SlotPool(max_running)
         self._pause_requested: set[str] = set()
         self._store = store
@@ -152,6 +188,68 @@ class Supervisor:
             self._pool.waiting,
             self._pool.max_seen,
         )
+
+    @property
+    def budget_manager(self) -> BudgetManager | None:
+        """The shared manager; None until the first job task has run."""
+        return self._budget
+
+    async def _ensure_budget(self) -> BudgetManager:
+        # The initialisation reads the store (an await), so concurrent job tasks would each
+        # build their own manager without the lock; with it the first builds, the rest reuse.
+        async with self._budget_lock:
+            if self._budget is None:
+                self._budget = await BudgetManager.from_store(
+                    self._store,
+                    self._global_budget,
+                    min_output_tokens=self._min_output_tokens,
+                )
+            return self._budget
+
+    async def extend(
+        self, job_id: str, *, active_seconds: float = 0.0, tokens: int = 0, usd_micros: int = 0
+    ) -> None:
+        """Raise a job's budget limits (unlimited stays unlimited).
+
+        Appends `budget_extended`. An over_budget job is moved to queued and re-admitted; a
+        running job's live step has its deadline rescheduled; other states only get the new
+        limits. Raises NotExtendable for done/failed/cancelled jobs.
+        """
+        job = await self._store.get_job(job_id)
+        if job is None:
+            raise UnknownJob(f"unknown job {job_id}")
+        if job.state in TERMINAL_STATES:
+            raise NotExtendable(f"job {job_id} is already {job.state.value}")
+        try:
+            await self._store.append_group(
+                [
+                    Event(
+                        job_id=job_id,
+                        epoch=job.epoch,
+                        ts=self._clock(),
+                        type=EventType.BUDGET_EXTENDED,
+                        payload={
+                            "active_seconds": active_seconds,
+                            "tokens": tokens,
+                            "usd_micros": usd_micros,
+                        },
+                    )
+                ]
+            )
+        except ProjectionError as exc:  # the job finished while we were appending
+            raise NotExtendable(f"job {job_id} finished concurrently") from exc
+        job = await self._store.get_job(job_id)
+        assert job is not None
+        watch = self._watches.get(job_id)
+        if watch is not None:
+            watch.limit_changed(job.budget.active_seconds)
+        if job.state is JobState.OVER_BUDGET:
+            await self.wait(job_id)  # the over_budget task may still be releasing its slot
+            try:
+                await self._append_state(job, JobState.QUEUED, "budget extended")
+            except ProjectionError:
+                return  # a concurrent extend already re-queued it
+            self.start(job_id)
 
     def outcome(self, job_id: str) -> Outcome | None:
         """The outcome of the job's most recent finished task, or None if none finished yet."""
@@ -271,11 +369,13 @@ class Supervisor:
     async def _run(self, job_id: str) -> Job:
         # Acquire first, with no await before it, so admission order is start() order.
         slot = await self._pool.acquire()
+        watch = self._watches[job_id] = DeadlineWatch(self._grace_s)
         try:
             logger.info("job admitted job_id=%s", job_id, extra={"job_id": job_id})
             job = await self._store.get_job(job_id)
             if job is None:
                 raise JobNotRunnable(f"unknown job {job_id}")
+            budget = await self._ensure_budget()
             agent = self._agent_factory(job)
             env = self._env_factory(job) if self._env_factory is not None else None
             return await run_job(
@@ -286,8 +386,14 @@ class Supervisor:
                 env=env,
                 sink=self._sink_factory(job) if self._sink_factory is not None else None,
                 should_pause=lambda: job_id in self._pause_requested,
+                budget=budget,
+                rate_limiter=self._rate_limiter,
+                grace_s=self._grace_s,
+                watch=watch,
             )
         finally:
+            if self._watches.get(job_id) is watch:
+                del self._watches[job_id]
             slot.release()  # cleanup only: never write to the store here
 
     def _on_done(self, job_id: str, task: asyncio.Task[Job]) -> None:
@@ -376,6 +482,7 @@ class Supervisor:
 __all__ = [
     "AlreadyRunning",
     "NotCancellable",
+    "NotExtendable",
     "NotPausable",
     "NotResumable",
     "Outcome",

@@ -27,6 +27,14 @@ class ReplayPolicy(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class Pricing:
+    """Integer micro-dollars per token, used to turn a token reservation into a usd one."""
+
+    input_usd_micros: int = 0
+    output_usd_micros: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class ToolSpec:
     name: str
     replay: ReplayPolicy
@@ -82,7 +90,12 @@ class StepContext:
 
     `rng` is seeded from (job seed, step) only, not the attempt, so a re-run of a step draws
     the same numbers. `budget` and `usage` are the projection's view when the step began;
-    enforcement is the runtime's business (commit 13), agents merely see how much is left.
+    enforcement is the runtime's business, agents merely see how much is left.
+
+    `max_output_tokens` is the output cap the budget manager granted for THIS sample call. The
+    agent MUST NOT generate more: a real provider adapter passes it as `max_tokens` /
+    `max_output_tokens`. None means the call is not budget-reserved (no cap beyond the agent's
+    own). Staying within the cap is what makes token overshoot exactly 0 on reserved calls.
     """
 
     job_id: str
@@ -93,6 +106,7 @@ class StepContext:
     usage: Usage = field(default_factory=Usage)
     workdir: Path | None = None  # the job's environment directory, if it has one
     effects: EffectCaller | None = None  # the effect journal, when the runner has a sink
+    max_output_tokens: int | None = None  # granted output cap for sample (see above)
 
     async def effect(
         self, kind: str, args: Mapping[str, Any], *, policy: ReplayPolicy
@@ -110,6 +124,12 @@ class StepContext:
 class Agent(Protocol):
     config_hash: str  # hash of model id, system prompt and tool schemas
     tools: Sequence[ToolSpec]
+    max_output_tokens: int  # most output tokens one sample call may ask for
+    pricing: Pricing  # for turning token reservations into usd reservations
+
+    def estimate_input_tokens(self, history: Sequence[Message]) -> int:
+        """Upper-bound estimate of the prompt size for a sample call over `history`."""
+        ...
 
     async def sample(self, ctx: StepContext, history: Sequence[Message]) -> ModelResponse: ...
 
