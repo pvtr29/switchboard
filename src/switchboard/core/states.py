@@ -25,9 +25,11 @@ _S = JobState
 
 # running -> queued exists for recovery: after a daemon restart or a lost lease the job is
 # re-queued and resumes from its last checkpoint rather than being failed.
+# provisioning -> queued exists for the same reason: a crash while the environment is being
+# provisioned must leave the job re-queueable (provision() is idempotent, so it simply redoes it).
 _EXPLICIT: dict[JobState, frozenset[JobState]] = {
     _S.QUEUED: frozenset({_S.PROVISIONING}),
-    _S.PROVISIONING: frozenset({_S.RUNNING, _S.FAILED}),
+    _S.PROVISIONING: frozenset({_S.RUNNING, _S.FAILED, _S.QUEUED}),
     _S.RUNNING: frozenset({_S.PAUSED, _S.OVER_BUDGET, _S.QUEUED, _S.VERIFYING, _S.FAILED}),
     _S.PAUSED: frozenset({_S.QUEUED}),
     _S.OVER_BUDGET: frozenset({_S.QUEUED}),

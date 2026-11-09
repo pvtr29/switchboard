@@ -143,10 +143,6 @@ async def test_sigterm_with_a_stuck_job_cancels_after_the_timeout(
         assert not [e for e in events if e.type is T.LLM_RESPONDED]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="recovery on startup is commit 18: a restarted daemon does not yet re-queue jobs",
-)
 async def test_restarted_daemon_resumes_running_jobs(
     sock_dir: Path, tmp_path: Path, template: Path
 ) -> None:

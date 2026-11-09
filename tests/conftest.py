@@ -18,6 +18,14 @@ from switchboard.daemon.server import Daemon
 from switchboard.store import EventStore
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "chaos: kill -9 chaos tests against a real daemon subprocess (see tests/chaos); "
+        "run only these with `pytest -m chaos`",
+    )
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _main_thread_event_loop() -> Iterator[None]:
     # looptime's pytest_pyfunc_call hook calls policy.get_event_loop() for every test. In a sync

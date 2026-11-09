@@ -34,6 +34,16 @@ extra keys `steps`, `token_interval` and `env_template` (the projection ignores 
 `envs_dir` when a template was given. The supervisor's factories are synchronous, so specs are
 cached in memory, filled at submit and (for jobs created by an earlier daemon process) loaded
 from the log by `_ensure_spec` before a job is started again.
+
+Recovery (runtime/recovery.py): `start` runs `recover` after the store and supervisor exist and
+BEFORE the server starts listening, so no client can observe the half-recovered state. The
+report is kept and exposed in `stats` ("recovery"). `verify_projection` (None = automatic, see
+recovery.py) is the consistency check of the live projection against a fold of the log.
+
+External sink for the chaos harness: `sink_db` gives every job a persistent `SQLiteSink` (its
+own SQLite file, so applications survive kill -9); `sink_naive` makes it non-idempotent. The
+extra `job_created` keys `effect_every`, `effect_policy` and (testing only) `exit_at_step` make
+the FakeAgent perform external effects / hard-exit the process.
 """
 
 import asyncio
@@ -84,7 +94,9 @@ from switchboard.daemon.protocol import (
 )
 from switchboard.env.base import Environment
 from switchboard.env.dir_env import DirEnv
-from switchboard.runtime.agent import Agent
+from switchboard.runtime.agent import Agent, ReplayPolicy
+from switchboard.runtime.recovery import RecoveryReport, recover
+from switchboard.runtime.sinks import SQLiteSink
 from switchboard.runtime.supervisor import (
     AlreadyRunning,
     NotCancellable,
@@ -128,13 +140,20 @@ class JobSpec:
     steps: int = 5
     token_interval: float = 0.01
     env_template: str | None = None
+    effect_every: int = 0
+    effect_policy: str = ReplayPolicy.KEYED.value
+    exit_at_step: int | None = None
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "JobSpec":
+        exit_at = payload.get("exit_at_step")
         return cls(
             steps=int(payload.get("steps", 5)),
             token_interval=float(payload.get("token_interval", 0.01)),
             env_template=payload.get("env_template"),
+            effect_every=int(payload.get("effect_every", 0)),
+            effect_policy=str(payload.get("effect_policy", ReplayPolicy.KEYED.value)),
+            exit_at_step=None if exit_at is None else int(exit_at),
         )
 
 
@@ -400,7 +419,15 @@ class Daemon:
         shutdown_timeout: float = DEFAULT_SHUTDOWN_TIMEOUT_S,
         bus_queue_size: int = DEFAULT_QUEUE_SIZE,
         clock: Callable[[], float] = time.time,
+        sink_db: str | Path | None = None,
+        sink_naive: bool = False,
+        verify_projection: bool | None = None,
     ) -> None:
+        self.sink_db = Path(sink_db) if sink_db is not None else None
+        self.sink_naive = sink_naive
+        self.verify_projection = verify_projection
+        self.recovery: RecoveryReport | None = None
+        self._sink: SQLiteSink | None = None
         self.socket_path = Path(socket_path)
         self.db_path = Path(db_path)
         self.envs_dir = Path(envs_dir)
@@ -455,12 +482,23 @@ class Daemon:
             self._store = await EventStore.open(self.db_path)
             self._bus = EventBus(queue_size=self._bus_queue_size)
             self._store.add_listener(self._bus.publish)
+            if self.sink_db is not None:
+                self._sink = await SQLiteSink.open(self.sink_db, idempotent=not self.sink_naive)
             self._supervisor = Supervisor(
                 self._store,
                 self._agent_factory,
                 self._env_factory,
+                self._sink_factory,
                 clock=self._clock,
                 max_running=self.max_running,
+            )
+            # Before the server listens: nobody sees the half-recovered state.
+            self.recovery = await recover(
+                self._store,
+                self._supervisor,
+                prepare=self._ensure_spec,
+                verify=self.verify_projection,
+                clock=self._clock,
             )
             self._server = await asyncio.start_unix_server(
                 self._on_connect, sock=sock, limit=MAX_LINE_BYTES
@@ -562,6 +600,8 @@ class Daemon:
         if self._store is not None:
             self._store.remove_listener(self.bus.publish)
             await self._store.aclose()
+        if self._sink is not None:
+            await self._sink.aclose()
         self.socket_path.unlink(missing_ok=True)
 
     # ---- connections --------------------------------------------------------------------
@@ -580,7 +620,16 @@ class Daemon:
     # ---- factories ----------------------------------------------------------------------
     def _agent_factory(self, job: Job) -> Agent:
         spec = self._specs[job.job_id]
-        return FakeAgent(steps=spec.steps, token_interval=spec.token_interval)
+        return FakeAgent(
+            steps=spec.steps,
+            token_interval=spec.token_interval,
+            effect_every=spec.effect_every,
+            effect_policy=ReplayPolicy(spec.effect_policy),
+            exit_at_step=spec.exit_at_step,
+        )
+
+    def _sink_factory(self, job: Job) -> SQLiteSink | None:
+        return self._sink
 
     def _env_factory(self, job: Job) -> Environment | None:
         template = self._specs[job.job_id].env_template
@@ -636,6 +685,9 @@ class Daemon:
                 "env_template",
                 "instructions",
                 "token_interval",
+                "effect_every",
+                "effect_policy",
+                "exit_at_step",
             },
         )
         if self._closing:
@@ -650,13 +702,27 @@ class Daemon:
         seed = _int(a, "seed", 0, -(2**53), 2**53)
         steps = _int(a, "steps", 5, 1, MAX_STEPS)
         interval = _num(a, "token_interval", 0.01, 0.0, 10.0)
+        effect_every = _int(a, "effect_every", 0, 0, MAX_STEPS)
+        policy = _str(a, "effect_policy", required=False) or ReplayPolicy.KEYED.value
+        if policy not in {p.value for p in ReplayPolicy}:
+            raise ProtocolError(BAD_ARGS, f"unknown effect_policy {policy!r}")
+        if effect_every and self._sink is None:
+            raise ProtocolError(BAD_ARGS, "effect_every needs a daemon started with --sink-db")
+        exit_at = _int(a, "exit_at_step", -1, -1, MAX_STEPS)  # -1: never (testing only)
         template = _str(a, "env_template", required=False)
         if template is not None and not await asyncio.to_thread(Path(template).is_dir):
             raise ProtocolError(BAD_ARGS, f"env_template {template} is not a directory")
         instructions = a.get("instructions", [])
         if not isinstance(instructions, list) or not all(isinstance(m, dict) for m in instructions):
             raise ProtocolError(BAD_ARGS, "instructions must be a list of objects")
-        spec = JobSpec(steps=steps, token_interval=interval, env_template=template)
+        spec = JobSpec(
+            steps=steps,
+            token_interval=interval,
+            env_template=template,
+            effect_every=effect_every,
+            effect_policy=policy,
+            exit_at_step=None if exit_at < 0 else exit_at,
+        )
         job_id = f"job-{uuid.uuid4().hex[:8]}"
         self._specs[job_id] = spec
         try:
@@ -676,6 +742,9 @@ class Daemon:
                         "steps": steps,
                         "token_interval": interval,
                         "env_template": template,
+                        "effect_every": effect_every,
+                        "effect_policy": policy,
+                        "exit_at_step": spec.exit_at_step,
                     },
                 )
             )
@@ -746,6 +815,7 @@ class Daemon:
             "supervisor": dataclasses.asdict(self.supervisor.stats),
             "store": dataclasses.asdict(self.store.stats),
             "bus": dataclasses.asdict(self.bus.stats),
+            "recovery": (None if self.recovery is None else dataclasses.asdict(self.recovery)),
         }
 
     async def _shutdown_cmd(self, a: Mapping[str, Any]) -> Result:

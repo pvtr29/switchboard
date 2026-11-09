@@ -19,6 +19,7 @@ LEGAL: frozenset[tuple[JobState, JobState]] = frozenset(
         (S.QUEUED, S.PROVISIONING),
         (S.PROVISIONING, S.RUNNING),
         (S.PROVISIONING, S.FAILED),
+        (S.PROVISIONING, S.QUEUED),  # recovery: a crash during provisioning is re-queueable
         (S.RUNNING, S.PAUSED),
         (S.RUNNING, S.OVER_BUDGET),
         (S.RUNNING, S.QUEUED),
@@ -43,7 +44,7 @@ NON_TERMINAL = [s for s in JobState if s not in TERMINAL_STATES]
 
 def test_pair_count() -> None:
     assert len(ALL_PAIRS) == 81
-    assert len(LEGAL) == 18
+    assert len(LEGAL) == 19
 
 
 @pytest.mark.parametrize(("src", "dst"), ALL_PAIRS)

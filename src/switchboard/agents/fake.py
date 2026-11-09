@@ -7,6 +7,7 @@ re-sampled or re-run step reproduces the same response and tool results exactly.
 import asyncio
 import hashlib
 import json
+import os
 import random
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -28,6 +29,7 @@ from switchboard.runtime.effects import ExternalSink, effect_key
 
 PROMPT_TOKENS = 50
 USD_MICROS_PER_TOKEN = 3
+EXIT_CODE = 86  # exit status of a FakeAgent that hard-exits (`exit_at_step`)
 MAX_OUTPUT_TOKENS = 8  # the most tokens FakeModel streams per call
 
 TOOLS: tuple[ToolSpec, ...] = (
@@ -143,10 +145,14 @@ class FakeAgent:
         effect_every: int = 0,
         effect_policy: ReplayPolicy = ReplayPolicy.KEYED,
         naive_sink: ExternalSink | None = None,
+        exit_at_step: int | None = None,
     ) -> None:
         self.effect_every = effect_every
         self.effect_policy = effect_policy
         self.naive_sink = naive_sink
+        self.exit_at_step = exit_at_step
+        """Chaos/testing only: `os._exit` the whole process at the start of act of this step, like
+        kill -9 (no cleanup, no flush). Never set it in-process."""
         self.effect_results: list[EffectResult] = []
         """Every result `ctx.effect` returned, in call order (across attempts of this object)."""
         self.on_file_write = on_file_write
@@ -223,6 +229,8 @@ class FakeAgent:
 
     async def act(self, ctx: StepContext, response: ModelResponse) -> ActResult:
         self.act_calls.append((ctx.step, ctx.attempt))
+        if ctx.step == self.exit_at_step:
+            os._exit(EXIT_CODE)
         if ctx.step == self.fail_at_step:
             raise RuntimeError(f"fake failure at step {ctx.step}")
         results = tuple(

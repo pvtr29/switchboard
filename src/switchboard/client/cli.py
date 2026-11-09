@@ -57,6 +57,17 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--envs", default=str(Path(DEFAULT_HOME + "/envs").expanduser()))
     d.add_argument("--max-running", type=int, default=8, metavar="N")
     d.add_argument("--shutdown-timeout", type=float, default=10.0, metavar="SECONDS")
+    d.add_argument(
+        "--verify-projection",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="on startup compare the jobs projection with a fold of the log "
+        "(default: all jobs when there are at most 1000, else a sample of 100)",
+    )
+    d.add_argument("--sink-db", metavar="PATH", help="give jobs a persistent fake external sink")
+    d.add_argument(
+        "--sink-naive", action="store_true", help="make the sink non-idempotent (baseline runs)"
+    )
 
     s = add("submit", "submit a fake job; prints its id")
     s.add_argument("--steps", type=int, default=5)
@@ -67,6 +78,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--budget-usd-micros", type=int)
     s.add_argument("--env-template", metavar="DIR")
     s.add_argument("--token-interval", type=float, help="seconds per fake token (default 0.01)")
+    s.add_argument("--effect-every", type=int, help="external effect every N steps (needs a sink)")
+    s.add_argument("--effect-policy", choices=["safe", "keyed", "unsafe"])
 
     ps = add("ps", "list jobs")
     ps.add_argument("--state", help="only jobs in this state")
@@ -190,6 +203,10 @@ async def _command(args: argparse.Namespace) -> int:
                     extra["env_template"] = args.env_template  # made absolute in main()
                 if args.token_interval is not None:
                     extra["token_interval"] = args.token_interval
+                if args.effect_every is not None:
+                    extra["effect_every"] = args.effect_every
+                if args.effect_policy is not None:
+                    extra["effect_policy"] = args.effect_policy
                 r = await c.request(
                     "submit",
                     kind="fake",
@@ -241,6 +258,9 @@ def _run_daemon(args: argparse.Namespace) -> int:
         envs_dir=args.envs,
         max_running=args.max_running,
         shutdown_timeout=args.shutdown_timeout,
+        sink_db=args.sink_db,
+        sink_naive=args.sink_naive,
+        verify_projection=args.verify_projection,
     )
     try:
         asyncio.run(daemon.run())
