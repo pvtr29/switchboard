@@ -8,6 +8,7 @@ from switchboard.store.interface import (
 )
 from switchboard.store.schema import SCHEMA_VERSION, SchemaVersionError, migrate
 from switchboard.store.sqlite import PAYLOAD_VERSIONS, SQLiteEventLog, encode_event, open_db
+from switchboard.store.writer import EventStore, StoreClosed, StoreStats, WriterCrashed
 
 __all__ = [
     "PAYLOAD_VERSIONS",
@@ -15,9 +16,13 @@ __all__ = [
     "AppendResult",
     "AppendStatus",
     "EventLog",
+    "EventStore",
     "SQLiteEventLog",
     "SchemaVersionError",
+    "StoreClosed",
+    "StoreStats",
     "UnknownEventVersion",
+    "WriterCrashed",
     "encode_event",
     "migrate",
     "open_db",
