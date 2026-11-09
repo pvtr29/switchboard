@@ -1,5 +1,7 @@
 import math
 import sqlite3
+from collections.abc import Iterator
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -29,8 +31,11 @@ def ev(
 
 
 @pytest.fixture
-def db(tmp_path: Path) -> sqlite3.Connection:
-    return open_db(tmp_path / "sb.db")
+def db(tmp_path: Path) -> Iterator[sqlite3.Connection]:
+    # Python 3.13+ warns (ResourceWarning, fatal here) about sqlite3 connections never closed.
+    conn = open_db(tmp_path / "sb.db")
+    yield conn
+    conn.close()
 
 
 @pytest.fixture
@@ -39,21 +44,22 @@ def log(db: sqlite3.Connection) -> SQLiteEventLog:
 
 
 def test_migrate_fresh_creates_everything(tmp_path: Path) -> None:
-    conn = sqlite3.connect(tmp_path / "raw.db", isolation_level=None)
-    assert migrate(conn) == 1 == SCHEMA_VERSION
-    names = {
-        r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")
-    }
-    assert {"schema_version", "events", "snapshots", "effects", "jobs"} <= names
-    assert {"events_job", "events_step"} <= names
-    assert conn.execute("SELECT version FROM schema_version").fetchall() == [(1,)]
+    with closing(sqlite3.connect(tmp_path / "raw.db", isolation_level=None)) as conn:
+        assert migrate(conn) == 1 == SCHEMA_VERSION
+        names = {
+            r[0]
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")
+        }
+        assert {"schema_version", "events", "snapshots", "effects", "jobs"} <= names
+        assert {"events_job", "events_step"} <= names
+        assert conn.execute("SELECT version FROM schema_version").fetchall() == [(1,)]
 
 
 def test_migrate_twice_is_noop(tmp_path: Path) -> None:
-    conn = sqlite3.connect(tmp_path / "raw.db", isolation_level=None)
-    migrate(conn)
-    assert migrate(conn) == 1
-    assert conn.execute("SELECT COUNT(*) FROM schema_version").fetchone() == (1,)
+    with closing(sqlite3.connect(tmp_path / "raw.db", isolation_level=None)) as conn:
+        migrate(conn)
+        assert migrate(conn) == 1
+        assert conn.execute("SELECT COUNT(*) FROM schema_version").fetchone() == (1,)
 
 
 def test_future_version_refused(tmp_path: Path) -> None:
