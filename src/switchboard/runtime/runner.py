@@ -221,6 +221,7 @@ async def run_job(
     env: Environment | None = None,
     keep_last: int = 2,
     should_pause: Callable[[], bool] | None = None,
+    should_stop: Callable[[], bool] | None = None,
     sink: ExternalSink | None = None,
     budget: BudgetManager | None = None,
     rate_limiter: TokenBucket | None = None,
@@ -240,6 +241,10 @@ async def run_job(
     `should_pause` is polled at every step boundary, before `step_started` of the next step
     (including the first). When it returns True the runner appends running -> paused and
     returns the paused job. It is cooperative: a step in flight always commits first.
+
+    `should_stop` is polled at the same boundary, before `should_pause`. When it returns True the
+    runner returns the job as it is and appends NOTHING: the job stays `running` and recovery
+    resumes it (this is the daemon's graceful shutdown; contrast with pause).
 
     `sink` enables `ctx.effect`: each step attempt gets an `EffectJournal` over it (see
     runtime/effects.py). Effects are reconciled lazily, when the re-run act phase reaches the
@@ -359,6 +364,8 @@ async def run_job(
         mark = None  # nothing of this step is unrecorded yet
         if job.state is not JobState.RUNNING:
             return job  # finished, failed or cancelled by someone else
+        if should_stop is not None and should_stop():
+            return job  # drain: a boundary, nothing written, the job stays running
         if should_pause is not None and should_pause():
             # A boundary: the previous step is committed and the next has not started, so the
             # log is consistent. Nothing but the state move is written.

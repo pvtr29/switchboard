@@ -1,6 +1,10 @@
 import asyncio
 import gc
 import logging
+import shutil
+import socket
+import tempfile
+import time
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Self
@@ -8,7 +12,9 @@ from typing import Any, Self
 import pytest
 import pytest_asyncio
 
+from switchboard.client.conn import Client
 from switchboard.core import Event, EventType
+from switchboard.daemon.server import Daemon
 from switchboard.store import EventStore
 
 
@@ -118,3 +124,81 @@ async def create_job(
 async def store(tmp_path: Path) -> AsyncIterator[EventStore]:
     async with await EventStore.open(tmp_path / "sb.db") as s:
         yield s
+
+
+@pytest.fixture
+def sock_dir() -> Iterator[Path]:
+    """A short directory for sockets: AF_UNIX paths are limited to ~104 bytes on macOS."""
+    d = Path(tempfile.mkdtemp(prefix="sb", dir="/tmp"))
+    try:
+        yield d
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@pytest.fixture
+def template(tmp_path: Path) -> Path:
+    t = tmp_path / "template"
+    (t / "files").mkdir(parents=True)
+    (t / "README").write_text("seed project\n")
+    return t
+
+
+@pytest_asyncio.fixture
+async def daemon(sock_dir: Path, tmp_path: Path) -> AsyncIterator[Daemon]:
+    d = Daemon(
+        socket_path=sock_dir / "s",
+        db_path=tmp_path / "sb.db",
+        envs_dir=tmp_path / "envs",
+        shutdown_timeout=5.0,
+    )
+    await d.start()
+    try:
+        yield d
+    finally:
+        await d.shutdown()
+
+
+@pytest_asyncio.fixture
+async def client(daemon: Daemon) -> AsyncIterator[Client]:
+    async with await Client.connect(str(daemon.socket_path)) as c:
+        yield c
+
+
+async def wait_state(
+    client: Client, job_id: str, states: set[str], *, within: float = 10.0
+) -> dict[str, Any]:
+    """Poll `get` until the job is in one of `states`; returns the job dict."""
+    async with asyncio.timeout(within):
+        while True:
+            job: dict[str, Any] = (await client.request("get", job_id=job_id))["job"]
+            if job["state"] in states:
+                return job
+            await asyncio.sleep(0.02)
+
+
+async def wait_steps(
+    client: Client, job_ids: Sequence[str], steps: int, *, within: float = 15.0
+) -> None:
+    """Poll until every job has committed at least `steps` steps."""
+    async with asyncio.timeout(within):
+        while True:
+            jobs = [(await client.request("get", job_id=j))["job"] for j in job_ids]
+            if all(j["last_step"] is not None and j["last_step"] + 1 >= steps for j in jobs):
+                return
+            await asyncio.sleep(0.02)
+
+
+def wait_for_socket(path: Path, timeout: float = 10.0) -> None:
+    """Sync helper for subprocess tests: wait until something accepts connections."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.connect(str(path))
+            return
+        except OSError:
+            time.sleep(0.05)
+        finally:
+            s.close()
+    raise TimeoutError(f"nothing listening on {path}")

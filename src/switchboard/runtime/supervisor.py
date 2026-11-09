@@ -41,6 +41,11 @@ without running a step (there is no legal queued -> paused edge). `resume()` bef
 cancels the pending pause. Pausing a job without a live task raises NotPausable. `pause()`
 returns as soon as the request is recorded; `wait(job_id)` returns once the task ended.
 
+Drain (graceful shutdown): `drain()` makes every job return at its next step boundary WITHOUT
+writing anything (`run_job(should_stop=)`), so jobs stay `running` and recovery resumes them;
+job tasks still waiting for a slot return without starting. `wait_idle(within)` waits for the
+tasks to end, `aclose` then cancels what is left. A draining supervisor refuses `start`.
+
 Budgets: `Supervisor` owns one `BudgetManager` shared by all its jobs (global token/usd caps,
 `global_budget=`) and an optional shared `TokenBucket` (`rate_limiter=`); its global usage is
 initialised lazily, under a lock, from the store (the first job task to run does it, because
@@ -165,6 +170,7 @@ class Supervisor:
         self._followups: set[asyncio.Task[None]] = set()
         self._outcomes: dict[str, Outcome] = {}
         self._closed = False
+        self._draining = False
         self._started = 0
         self._finished = 0
         self._crashed = 0
@@ -256,8 +262,8 @@ class Supervisor:
         return self._outcomes.get(job_id)
 
     def start(self, job_id: str) -> None:
-        if self._closed:
-            raise SupervisorClosed("supervisor is closed")
+        if self._closed or self._draining:
+            raise SupervisorClosed("supervisor is closed or draining")
         if job_id in self._tasks:
             raise AlreadyRunning(f"job {job_id} already has a live task")
         task = asyncio.create_task(self._run(job_id), name=f"job:{job_id}")
@@ -353,6 +359,18 @@ class Supervisor:
         if task is not None:
             await asyncio.wait({task})
 
+    def drain(self) -> None:
+        """Ask every job to stop at its next step boundary, writing nothing. Idempotent."""
+        self._draining = True
+
+    async def wait_idle(self, within: float | None = None) -> bool:
+        """Wait until no job task is alive; False if `within` seconds passed first."""
+        tasks = list(self._tasks.values())
+        if not tasks:
+            return True
+        _, pending = await asyncio.wait(tasks, timeout=within)
+        return not pending
+
     async def aclose(self) -> None:
         """Cancel every live job, await them and the follow-ups. Idempotent."""
         self._closed = True
@@ -375,6 +393,8 @@ class Supervisor:
             job = await self._store.get_job(job_id)
             if job is None:
                 raise JobNotRunnable(f"unknown job {job_id}")
+            if self._draining:
+                return job  # shutdown began while we waited for the slot: touch nothing
             budget = await self._ensure_budget()
             agent = self._agent_factory(job)
             env = self._env_factory(job) if self._env_factory is not None else None
@@ -386,6 +406,7 @@ class Supervisor:
                 env=env,
                 sink=self._sink_factory(job) if self._sink_factory is not None else None,
                 should_pause=lambda: job_id in self._pause_requested,
+                should_stop=lambda: self._draining,
                 budget=budget,
                 rate_limiter=self._rate_limiter,
                 grace_s=self._grace_s,

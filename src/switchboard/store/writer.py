@@ -24,12 +24,19 @@ Acks are sent only after COMMIT returned.
 Backpressure: the queue is bounded; ``append`` awaits ``queue.put`` when it is full, so
 producers slow down instead of memory growing.
 
+Commit listeners: `add_listener(fn)` registers a plain function called on the event loop, after
+each committed batch and before the callers' acks, with the events that batch INSERTED (seq
+set, commit order). Duplicates and rejected groups are not reported. A listener must be quick
+and must never await; an exception from one is logged and swallowed, so a faulty listener can
+neither break the writer nor delay other listeners.
+
 Cancellation: a caller cancelled while awaiting its ack may still have its events written
 (they are already queued); only the ack is lost. The writer skips cancelled futures.
 """
 
 import asyncio
-from collections.abc import Sequence
+import logging
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,7 +45,11 @@ from typing import Self
 
 from switchboard.core import Event, Job, JobState
 from switchboard.store.interface import AppendResult, AppendStatus, EffectRecord
-from switchboard.store.sqlite import SQLiteEventLog, encode_event, open_db
+from switchboard.store.sqlite import SQLiteEventLog, _with_seq, encode_event, open_db
+
+logger = logging.getLogger("switchboard.store")
+
+type CommitListener = Callable[[Sequence[Event]], None]
 
 
 class StoreClosed(Exception):
@@ -101,6 +112,7 @@ class EventStore:
         self._rejected_groups = 0
         self._max_batch_seen = 0
         self._close_lock = asyncio.Lock()
+        self._listeners: list[CommitListener] = []
 
     @classmethod
     async def open(
@@ -216,6 +228,7 @@ class EventStore:
                 )
             self._transactions += 1
             self._max_batch_seen = max(self._max_batch_seen, count)
+            committed: list[Event] = []
             for (group, fut), outcome in zip(batch, outcomes, strict=True):
                 if isinstance(outcome, Exception):
                     # Projection-invalid group: nothing of it was written; others committed.
@@ -225,13 +238,36 @@ class EventStore:
                     continue
                 if len(outcome) != len(group):
                     raise RuntimeError("append_groups returned a wrong number of results")
+                if self._listeners:
+                    committed.extend(
+                        _with_seq(e, r.seq)
+                        for e, r in zip(group, outcome, strict=True)
+                        if r.seq is not None
+                    )
                 self._events_written += sum(r.status is AppendStatus.INSERTED for r in outcome)
                 self._duplicates += sum(r.status is AppendStatus.DUPLICATE for r in outcome)
                 if not fut.done():  # a cancelled caller no longer wants its ack
                     fut.set_result(outcome)
+            if committed:
+                self._notify(committed)
             self._inflight = []
             if stop:
                 return
+
+    def add_listener(self, listener: CommitListener) -> None:
+        """Call `listener(events)` on the loop after every committed batch (see module doc)."""
+        self._listeners.append(listener)
+
+    def remove_listener(self, listener: CommitListener) -> None:
+        if listener in self._listeners:
+            self._listeners.remove(listener)
+
+    def _notify(self, events: Sequence[Event]) -> None:
+        for listener in list(self._listeners):
+            try:
+                listener(events)
+            except Exception:
+                logger.exception("commit listener %r failed", listener)
 
     def _on_writer_done(self, task: asyncio.Task[None]) -> None:
         if task.cancelled():
