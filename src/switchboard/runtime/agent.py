@@ -9,6 +9,7 @@ import random
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
 from typing import Any, Protocol
 
 from switchboard.core import Budget, Remaining, Usage
@@ -68,6 +69,7 @@ class StepContext:
     rng: random.Random
     budget: Budget = field(default_factory=Budget)
     usage: Usage = field(default_factory=Usage)
+    workdir: Path | None = None  # the job's environment directory, if it has one
 
     @property
     def remaining(self) -> Remaining:

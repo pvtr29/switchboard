@@ -7,7 +7,9 @@ re-sampled or re-run step reproduces the same response and tool results exactly.
 import asyncio
 import hashlib
 import json
+import random
 from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 from switchboard.core import Usage
@@ -30,8 +32,30 @@ TOOLS: tuple[ToolSpec, ...] = (
     ToolSpec("echo", ReplayPolicy.SAFE),
 )
 
+FILE_TOOLS: tuple[ToolSpec, ...] = (
+    ToolSpec("write_file", ReplayPolicy.SAFE),  # idempotent: overwrites files/f{k}.txt
+    # NOT idempotent on its own: re-running it without restoring the environment first
+    # appends a second line, which is why recovery must restore S(n).
+    ToolSpec("append_file", ReplayPolicy.SAFE),
+)
+
+type FileWriteHook = Callable[[StepContext, str, Path], None]
+"""Called after each file tool finishes with (ctx, tool name, path); tests raise to crash
+mid-act with a partial write on disk."""
+
 type TokenHook = Callable[[StepContext, int], None]
 """Called after each streamed token with (ctx, token index); tests raise from it to crash."""
+
+
+def _write_file(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+def _append_file(path: Path, line: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as f:
+        f.write(line + "\n")
 
 
 def run_tool(name: str, args: Mapping[str, Any]) -> Any:
@@ -108,12 +132,14 @@ class FakeAgent:
         system_prompt: str = "You are a fake agent.",
         fail_at_step: int | None = None,
         on_token: TokenHook | None = None,
+        on_file_write: FileWriteHook | None = None,
     ) -> None:
+        self.on_file_write = on_file_write
         self.steps = steps
         self.fail_at_step = fail_at_step
         self.system_prompt = system_prompt
         self.model = FakeModel(token_interval=token_interval, on_token=on_token)
-        self.tools: Sequence[ToolSpec] = TOOLS
+        self.tools: Sequence[ToolSpec] = (*TOOLS, *FILE_TOOLS)
         self.config_hash = hashlib.sha256(
             json.dumps(
                 {
@@ -131,6 +157,35 @@ class FakeAgent:
         self.sample_calls.append((ctx.step, ctx.attempt))
         return await self.model.sample(ctx, history)
 
+    async def _file_effects(
+        self, ctx: StepContext, response: ModelResponse
+    ) -> list[dict[str, Any]]:
+        """Deterministic edits of ctx.workdir for this step.
+
+        ctx.rng is already advanced by sampling in an uninterrupted run but fresh when a logged
+        response is replayed, so it cannot drive the edits. They are seeded from the (logged)
+        response instead, which is itself a pure function of the rng: same run, same edits.
+        """
+        assert ctx.workdir is not None
+        seed = hashlib.sha256(json.dumps(response.message, sort_keys=True).encode()).hexdigest()
+        r = random.Random(f"files:{seed}")
+        out: list[dict[str, Any]] = []
+
+        async def effect(name: str, rel: str, text: str) -> None:
+            path = ctx.workdir / rel if ctx.workdir else Path(rel)
+            fn = _write_file if name == "write_file" else _append_file
+            await asyncio.to_thread(fn, path, text)
+            out.append({"role": "tool", "name": name, "content": rel})
+            if self.on_file_write is not None:
+                self.on_file_write(ctx, name, path)
+
+        await effect(
+            "write_file", f"files/f{r.randint(0, 3)}.txt", f"step {ctx.step} v{r.randint(0, 9999)}"
+        )
+        if ctx.step % 2 == 0 or r.random() < 0.5:
+            await effect("append_file", "log.txt", f"step {ctx.step} n{r.randint(0, 9999)}")
+        return out
+
     async def act(self, ctx: StepContext, response: ModelResponse) -> ActResult:
         self.act_calls.append((ctx.step, ctx.attempt))
         if ctx.step == self.fail_at_step:
@@ -144,5 +199,7 @@ class FakeAgent:
             }
             for c in response.tool_calls
         )
+        if ctx.workdir is not None:
+            results = (*results, *await self._file_effects(ctx, response))
         done = ctx.step + 1 >= self.steps
         return ActResult(messages=results, done=done, summary=f"step {ctx.step} done")

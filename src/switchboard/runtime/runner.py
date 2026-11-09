@@ -13,6 +13,16 @@ The runner never writes in a `finally`, and nothing about a half-finished step i
 so cancellation and crashes (including BaseException) simply leave the log at the last
 boundary. Agent state at step n is job_created.instructions plus the deltas of steps 0..n-1.
 
+Environment (optional, `env=`): a fresh job is provisioned and S(0) is snapshotted as
+"initial" (its ref rides in the provisioning -> running state_changed payload as `env_ref`).
+After the act phase and BEFORE the commit group the runner snapshots S(n+1) as
+`s{n+1}-a{attempt}` and puts the ref in step_completed. The attempt suffix means a snapshot
+orphaned by a crash between snapshot and commit can never be mistaken for a committed one; it
+is harmless and the next gc deletes it. After each commit gc keeps the initial ref and the
+last `keep_last` committed refs. On resume (job already running) the runner ALWAYS restores
+S(n) first, because an interrupted act phase may have left uncommitted changes, and logs a
+`restored` event. A missing snapshot fails the job with reason "snapshot missing".
+
 Failure policy: an `Exception` from the agent fails the job (state_changed running -> failed,
 reason "agent error: ...") and `run_job` RETURNS the failed job instead of raising, so a
 supervisor needs no exception handling to learn the outcome. CancelledError and other
@@ -39,6 +49,7 @@ from switchboard.core import (
     usage_from_dict,
     usage_to_dict,
 )
+from switchboard.env.base import Environment, SnapshotMissing
 from switchboard.runtime.agent import (
     ActResult,
     Agent,
@@ -52,6 +63,8 @@ from switchboard.store import AppendStatus, EventStore
 
 REASON_CONFIG_CHANGED = "config changed"
 REASON_RESTART_LIMIT = "restart limit"
+REASON_SNAPSHOT_MISSING = "snapshot missing"
+INITIAL_SNAPSHOT = "initial"
 
 
 class JobNotRunnable(RuntimeError):
@@ -66,6 +79,7 @@ class _LogView:
         self.responded: dict[int, Event] = {}
         self.completed: dict[int, Event] = {}
         self.started: Counter[int] = Counter()
+        self.initial_ref: str | None = None
         for e in events:
             match e.type:
                 case EventType.JOB_CREATED:
@@ -76,6 +90,9 @@ class _LogView:
                 case EventType.STEP_COMPLETED:
                     assert e.step_id is not None
                     self.completed[e.step_id] = e
+                case EventType.STATE_CHANGED:
+                    if e.payload.get("to") == JobState.RUNNING.value and e.payload.get("env_ref"):
+                        self.initial_ref = str(e.payload["env_ref"])
                 case EventType.STEP_STARTED:
                     assert e.step_id is not None
                     self.started[e.step_id] += 1
@@ -103,6 +120,21 @@ class _LogView:
         for n in range(len(self.completed)):
             out.extend(self.completed[n].payload["delta"])
         return out
+
+    def ref_before(self, n: int) -> str | None:
+        """S(n): the env_ref of step_completed(n-1), or the initial ref for n == 0."""
+        if n == 0:
+            return self.initial_ref
+        ref = self.completed[n - 1].payload.get("env_ref")
+        return None if ref is None else str(ref)
+
+    def keep_refs(self, last: int) -> list[str]:
+        refs = [
+            r
+            for n in range(max(0, len(self.completed) - last), len(self.completed))
+            if (r := self.completed[n].payload.get("env_ref"))
+        ]
+        return [*([self.initial_ref] if self.initial_ref else []), *map(str, refs)]
 
     def recorded_hashes(self) -> set[str]:
         assert self.created is not None
@@ -142,6 +174,8 @@ async def run_job(
     *,
     max_attempts_per_step: int = 5,
     clock: Callable[[], float] = time.time,
+    env: Environment | None = None,
+    keep_last: int = 2,
 ) -> Job:
     """Run `job_id` until it is verifying, failed, or no longer ours; return its projection.
 
@@ -173,7 +207,23 @@ async def run_job(
         assert current is not None
         return current
 
-    if job.state is JobState.QUEUED:
+    resumed = job.state is JobState.RUNNING
+    if env is not None and job.state in (JobState.QUEUED, JobState.PROVISIONING):
+        # A crash while provisioning leaves the job in `provisioning`; provision() is
+        # idempotent, so redoing it is safe.
+        if job.state is JobState.QUEUED:
+            await store.append_group(
+                [state_change(JobState.QUEUED, JobState.PROVISIONING, "runner started")]
+            )
+        await env.provision()
+        initial = await env.snapshot(INITIAL_SNAPSHOT)
+        running = state_change(JobState.PROVISIONING, JobState.RUNNING, "environment ready")
+        await store.append_group(
+            [event(EventType.STATE_CHANGED, {**running.payload, "env_ref": initial})]
+        )
+        log = _LogView(await store.read_job(job_id))
+        job = await _current()
+    elif job.state is JobState.QUEUED:
         await store.append_group(
             [
                 state_change(JobState.QUEUED, JobState.PROVISIONING, "runner started"),
@@ -190,6 +240,7 @@ async def run_job(
         return await fail(REASON_CONFIG_CHANGED)
 
     replay_by_tool = {t.name: t.replay for t in agent.tools}
+    needs_restore = resumed and env is not None
 
     while True:
         job = await _current()
@@ -199,6 +250,18 @@ async def run_job(
         attempt = log.started[n]
         if attempt >= max_attempts_per_step:
             return await fail(REASON_RESTART_LIMIT)
+        if env is not None and needs_restore:
+            needs_restore = False
+            ref = log.ref_before(n)
+            try:
+                if ref is None:
+                    raise SnapshotMissing(f"no snapshot recorded for S({n})")
+                await env.restore(ref)
+            except SnapshotMissing:
+                return await fail(REASON_SNAPSHOT_MISSING)
+            await store.append_group(
+                [event(EventType.RESTORED, {"step": n, "env_ref": ref, "reason": "resume"})]
+            )
         await store.append_group([event(EventType.STEP_STARTED, {"attempt": attempt}, n)])
 
         ctx = StepContext(
@@ -208,6 +271,7 @@ async def run_job(
             rng=_step_rng(log.seed, n),
             budget=job.budget,
             usage=job.usage,
+            workdir=env.workdir if env is not None else None,
         )
         history = log.history()
 
@@ -268,6 +332,9 @@ async def run_job(
             return await fail(f"agent error: {type(exc).__name__}: {exc}")
 
         # ---- commit -----------------------------------------------------------------------
+        env_ref: str | None = None
+        if env is not None:
+            env_ref = await env.snapshot(f"s{n + 1}-a{attempt}")
         delta: list[Message] = [response.message, *result.messages]
         group = [
             event(
@@ -277,7 +344,7 @@ async def run_job(
                     "done": result.done,
                     "summary": result.summary,
                     "config_hash": agent.config_hash,
-                    "env_ref": None,
+                    "env_ref": env_ref,
                 },
                 n,
             )
@@ -291,6 +358,8 @@ async def run_job(
             # rolled back). Re-read below and let the log decide.
             committed = []
         log = _LogView(await store.read_job(job_id))
+        if env is not None and n in log.completed:
+            await env.gc(log.keep_refs(keep_last))
         if committed and committed[0].status is AppendStatus.INSERTED and result.done:
             return await _current()
         # Otherwise (duplicate commit, refused group) the log is authoritative; the loop top
