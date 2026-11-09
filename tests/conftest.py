@@ -1,7 +1,9 @@
 import asyncio
+import gc
+import logging
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 import pytest
 import pytest_asyncio
@@ -21,6 +23,67 @@ def _main_thread_event_loop() -> Iterator[None]:
     yield
     asyncio.set_event_loop(None)
     loop.close()
+
+
+class AsyncioErrorCapture(logging.Handler):
+    """Collects ERROR records of the `asyncio` logger.
+
+    "Task was destroyed but it is pending!" and "Task exception was never retrieved" are not
+    warnings: asyncio reports them through `loop.call_exception_handler`, whose default handler
+    logs to the `asyncio` logger. `filterwarnings = error` cannot see them, this can.
+    """
+
+    def __init__(self, *, consume: bool = False) -> None:
+        """With `consume`, matching records are also hidden from other handlers (a logger
+        filter runs before any handler), so a test can provoke errors on purpose without
+        tripping the autouse guard."""
+        super().__init__(level=logging.ERROR)
+        self.consume = consume
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Nothing to do: `filter` already recorded the record, in handler mode and logger mode."""
+
+    def messages(self) -> list[str]:
+        out = []
+        for r in self.records:
+            text = r.getMessage()
+            if r.exc_info and r.exc_info[1] is not None:
+                text += f" [{type(r.exc_info[1]).__name__}: {r.exc_info[1]}]"
+            out.append(text)
+        return out
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.ERROR:
+            self.records.append(record)
+            return not self.consume
+        return True
+
+    def __enter__(self) -> Self:
+        logger = logging.getLogger("asyncio")
+        if self.consume:
+            logger.addFilter(self)
+        else:
+            logger.addHandler(self)
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        logger = logging.getLogger("asyncio")
+        if self.consume:
+            logger.removeFilter(self)
+        else:
+            logger.removeHandler(self)
+
+
+@pytest.fixture(autouse=True)
+def _asyncio_error_guard() -> Iterator[None]:
+    """Fail any test during which asyncio logged an error, including garbage found at teardown."""
+    with AsyncioErrorCapture() as capture:
+        yield
+        gc.collect()  # destroyed-while-pending tasks and unretrieved exceptions report on __del__
+        gc.collect()
+    if capture.records:
+        pytest.fail("asyncio reported errors:\n" + "\n".join(capture.messages()), pytrace=False)
 
 
 async def create_job(
