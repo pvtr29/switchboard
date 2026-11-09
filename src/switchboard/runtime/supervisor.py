@@ -21,7 +21,25 @@ Outcome recording (`_on_done`, synchronous):
 - It raised anything else (including a BaseException that is not CancelledError): the job is
   moved to failed with reason "supervisor: <type>: <msg>" by a tracked follow-up task, but only
   if its projected state still allows it (provisioning or running); otherwise it is only logged.
-- Cancelled: nothing appended (cancel semantics arrive with commit 11); just cleanup.
+- Cancelled: nothing appended here; `cancel()` appends `-> cancelled` after the task is gone.
+  `aclose` (shutdown) cancels tasks WITHOUT recording anything: those jobs stay resumable.
+
+Slots (`SlotPool`, see slots.py): a job task first waits for a slot (the job stays `queued` in
+the projection meanwhile), runs `run_job` while holding it and releases it in `finally`.
+Admission is FIFO. `pause` makes `run_job` return at a step boundary, which ends the task and
+frees the slot; `resume` queues a new task that waits for a slot like any other.
+
+Cancel: `cancel()` cancels the task, waits for it to finish, then appends `<state> ->
+cancelled` with the reason. The task itself writes nothing on cancel. A queued job (waiting for
+a slot) is cancelled the same way. Cancelling a cancelled job is a no-op; done/failed raise.
+
+Pause: cooperative. `pause()` sets a flag that `run_job` polls at the step boundary (before
+`step_started` of the next step), so an in-flight step always commits first. Decision for a
+job that is still waiting for a slot (or provisioning): the pause is remembered and takes
+effect at its first boundary, i.e. it is admitted, provisions, and goes running -> paused
+without running a step (there is no legal queued -> paused edge). `resume()` before that
+cancels the pending pause. Pausing a job without a live task raises NotPausable. `pause()`
+returns as soon as the request is recorded; `wait(job_id)` returns once the task ended.
 
 `wait(job_id)` returns None once the job's task has finished and never re-raises what the task
 raised; use `outcome(job_id)` for the Job, the exception, or the cancelled flag.
@@ -34,10 +52,11 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
-from switchboard.core import Event, EventType, Job, JobState
+from switchboard.core import TERMINAL_STATES, Event, EventType, Job, JobState, ProjectionError
 from switchboard.env.base import Environment
 from switchboard.runtime.agent import Agent
 from switchboard.runtime.runner import JobNotRunnable, run_job
+from switchboard.runtime.slots import SlotPool
 from switchboard.store import EventStore, StoreClosed
 
 logger = logging.getLogger("switchboard.supervisor")
@@ -49,6 +68,22 @@ class AlreadyRunning(RuntimeError):
 
 class SupervisorClosed(RuntimeError):
     """`start` was called after `aclose`."""
+
+
+class UnknownJob(LookupError):
+    """The job id has no job_created event."""
+
+
+class NotCancellable(RuntimeError):
+    """`cancel` was called for a job that already finished (done or failed)."""
+
+
+class NotPausable(RuntimeError):
+    """`pause` was called for a job that is not queued or running under this supervisor."""
+
+
+class NotResumable(RuntimeError):
+    """`resume` was called for a job that is not paused."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +101,9 @@ class SupervisorStats:
     finished: int  # run_job returned
     crashed: int  # run_job raised (not cancelled)
     cancelled: int
+    running: int  # slots held right now (provisioning or running jobs)
+    waiting: int  # job tasks waiting for a slot
+    max_running_seen: int  # high-water mark of `running`
 
 
 class Supervisor:
@@ -76,7 +114,10 @@ class Supervisor:
         env_factory: Callable[[Job], Environment | None] | None = None,
         *,
         clock: Callable[[], float] = time.time,
+        max_running: int = 8,
     ) -> None:
+        self._pool = SlotPool(max_running)
+        self._pause_requested: set[str] = set()
         self._store = store
         self._agent_factory = agent_factory
         self._env_factory = env_factory
@@ -99,7 +140,15 @@ class Supervisor:
 
     @property
     def stats(self) -> SupervisorStats:
-        return SupervisorStats(self._started, self._finished, self._crashed, self._cancelled)
+        return SupervisorStats(
+            self._started,
+            self._finished,
+            self._crashed,
+            self._cancelled,
+            self._pool.held,
+            self._pool.waiting,
+            self._pool.max_seen,
+        )
 
     def outcome(self, job_id: str) -> Outcome | None:
         """The outcome of the job's most recent finished task, or None if none finished yet."""
@@ -115,6 +164,87 @@ class Supervisor:
         self._outcomes.pop(job_id, None)
         self._started += 1
         task.add_done_callback(lambda t: self._on_done(job_id, t))
+
+    async def cancel(self, job_id: str, reason: str = "cancelled by user") -> None:
+        """Cancel a job wherever it is: waiting for a slot, running, or paused.
+
+        The task (if any) gets CancelledError and writes nothing; once it is gone this appends
+        `<current state> -> cancelled`. Idempotent for an already cancelled job.
+        """
+        job = await self._store.get_job(job_id)
+        if job is None:
+            raise UnknownJob(f"unknown job {job_id}")
+        if job.state in TERMINAL_STATES:
+            self._require_cancelled(job)
+            return
+        task = self._tasks.get(job_id)
+        if task is not None:
+            task.cancel()
+            await asyncio.wait({task})
+        # Re-read: the task may have finished (or a concurrent cancel won) while we waited.
+        job = await self._store.get_job(job_id)
+        assert job is not None
+        if job.state in TERMINAL_STATES:
+            self._require_cancelled(job)
+            return
+        try:
+            await self._append_state(job, JobState.CANCELLED, reason)
+        except ProjectionError:
+            job = await self._store.get_job(job_id)
+            assert job is not None
+            self._require_cancelled(job)  # lost a race: fine only if it ended cancelled
+
+    @staticmethod
+    def _require_cancelled(job: Job) -> None:
+        if job.state is not JobState.CANCELLED:
+            raise NotCancellable(f"job {job.job_id} is already {job.state.value}")
+
+    async def pause(self, job_id: str) -> None:
+        """Ask a live job to pause at its next step boundary (see module docstring)."""
+        job = await self._store.get_job(job_id)
+        if job is None:
+            raise UnknownJob(f"unknown job {job_id}")
+        if job.state is JobState.PAUSED:
+            return
+        task = self._tasks.get(job_id)
+        if (
+            task is None
+            or task.done()
+            or job.state not in (JobState.QUEUED, JobState.PROVISIONING, JobState.RUNNING)
+        ):
+            raise NotPausable(f"job {job_id} is {job.state.value} and cannot be paused")
+        self._pause_requested.add(job_id)
+
+    async def resume(self, job_id: str) -> None:
+        """paused -> queued, then start the job again through normal slot admission."""
+        task = self._tasks.get(job_id)
+        if task is not None and not task.done() and job_id in self._pause_requested:
+            self._pause_requested.discard(job_id)  # not paused yet: just withdraw the request
+            return
+        job = await self._store.get_job(job_id)
+        if job is None:
+            raise UnknownJob(f"unknown job {job_id}")
+        if job.state is not JobState.PAUSED:
+            raise NotResumable(f"job {job_id} is {job.state.value}, not paused")
+        await self.wait(job_id)  # the paused task may still be releasing its slot
+        try:
+            await self._append_state(job, JobState.QUEUED, "resumed by user")
+        except ProjectionError as exc:
+            raise NotResumable(f"job {job_id} was resumed concurrently") from exc
+        self.start(job_id)
+
+    async def _append_state(self, job: Job, to: JobState, reason: str) -> None:
+        await self._store.append_group(
+            [
+                Event(
+                    job_id=job.job_id,
+                    epoch=job.epoch,
+                    ts=self._clock(),
+                    type=EventType.STATE_CHANGED,
+                    payload={"from": job.state.value, "to": to.value, "reason": reason},
+                )
+            ]
+        )
 
     async def wait(self, job_id: str) -> None:
         """Return when the job's live task has finished (immediately if there is none)."""
@@ -136,16 +266,30 @@ class Supervisor:
             await asyncio.sleep(0)  # let their done callbacks discard them
 
     async def _run(self, job_id: str) -> Job:
-        job = await self._store.get_job(job_id)
-        if job is None:
-            raise JobNotRunnable(f"unknown job {job_id}")
-        agent = self._agent_factory(job)
-        env = self._env_factory(job) if self._env_factory is not None else None
-        return await run_job(self._store, job_id, agent, clock=self._clock, env=env)
+        # Acquire first, with no await before it, so admission order is start() order.
+        slot = await self._pool.acquire()
+        try:
+            logger.info("job admitted job_id=%s", job_id, extra={"job_id": job_id})
+            job = await self._store.get_job(job_id)
+            if job is None:
+                raise JobNotRunnable(f"unknown job {job_id}")
+            agent = self._agent_factory(job)
+            env = self._env_factory(job) if self._env_factory is not None else None
+            return await run_job(
+                self._store,
+                job_id,
+                agent,
+                clock=self._clock,
+                env=env,
+                should_pause=lambda: job_id in self._pause_requested,
+            )
+        finally:
+            slot.release()  # cleanup only: never write to the store here
 
     def _on_done(self, job_id: str, task: asyncio.Task[Job]) -> None:
         if self._tasks.get(job_id) is task:
             del self._tasks[job_id]
+            self._pause_requested.discard(job_id)
         if task.cancelled():
             self._cancelled += 1
             self._outcomes[job_id] = Outcome(cancelled=True)
@@ -227,8 +371,12 @@ class Supervisor:
 
 __all__ = [
     "AlreadyRunning",
+    "NotCancellable",
+    "NotPausable",
+    "NotResumable",
     "Outcome",
     "Supervisor",
     "SupervisorClosed",
     "SupervisorStats",
+    "UnknownJob",
 ]

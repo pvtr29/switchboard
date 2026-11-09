@@ -158,7 +158,7 @@ async def test_aclose_cancels_and_is_idempotent(store: EventStore) -> None:
     for i in range(3):
         job = await store.get_job(f"j{i}")
         assert job is not None
-        assert job.state is JobState.RUNNING  # cancellation is not a recorded outcome yet
+        assert job.state is JobState.RUNNING  # aclose (shutdown) records nothing: stays resumable
     with pytest.raises(SupervisorClosed):
         sup.start("j0")
 

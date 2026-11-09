@@ -80,6 +80,7 @@ class _LogView:
         self.completed: dict[int, Event] = {}
         self.started: Counter[int] = Counter()
         self.initial_ref: str | None = None
+        self.ran = False  # the job has been in `running` at least once (see run_job)
         for e in events:
             match e.type:
                 case EventType.JOB_CREATED:
@@ -91,8 +92,10 @@ class _LogView:
                     assert e.step_id is not None
                     self.completed[e.step_id] = e
                 case EventType.STATE_CHANGED:
-                    if e.payload.get("to") == JobState.RUNNING.value and e.payload.get("env_ref"):
-                        self.initial_ref = str(e.payload["env_ref"])
+                    if e.payload.get("to") == JobState.RUNNING.value:
+                        self.ran = True
+                        if e.payload.get("env_ref"):
+                            self.initial_ref = str(e.payload["env_ref"])
                 case EventType.STEP_STARTED:
                     assert e.step_id is not None
                     self.started[e.step_id] += 1
@@ -176,11 +179,21 @@ async def run_job(
     clock: Callable[[], float] = time.time,
     env: Environment | None = None,
     keep_last: int = 2,
+    should_pause: Callable[[], bool] | None = None,
 ) -> Job:
     """Run `job_id` until it is verifying, failed, or no longer ours; return its projection.
 
     A queued job is moved to running; a running job is resumed from its log. Any other state
     raises JobNotRunnable (recovery and the supervisor own those transitions later).
+
+    A `queued` job is either fresh or a resumed one (paused or re-queued by recovery). The log
+    tells them apart: a job whose log holds a `* -> running` state change has run before, so it
+    is NOT provisioned again (that would wipe its environment); it goes queued -> provisioning
+    -> running in one group and then takes the resume path (restore S(n)).
+
+    `should_pause` is polled at every step boundary, before `step_started` of the next step
+    (including the first). When it returns True the runner appends running -> paused and
+    returns the paused job. It is cooperative: a step in flight always commits first.
     """
     job = await store.get_job(job_id)
     if job is None:
@@ -208,7 +221,16 @@ async def run_job(
         return current
 
     resumed = job.state is JobState.RUNNING
-    if env is not None and job.state in (JobState.QUEUED, JobState.PROVISIONING):
+    if job.state is JobState.QUEUED and log.ran:
+        await store.append_group(
+            [
+                state_change(JobState.QUEUED, JobState.PROVISIONING, "resumed"),
+                state_change(JobState.PROVISIONING, JobState.RUNNING, "resumed"),
+            ]
+        )
+        resumed = True
+        job = await _current()
+    elif env is not None and job.state in (JobState.QUEUED, JobState.PROVISIONING):
         # A crash while provisioning leaves the job in `provisioning`; provision() is
         # idempotent, so redoing it is safe.
         if job.state is JobState.QUEUED:
@@ -246,6 +268,13 @@ async def run_job(
         job = await _current()
         if job.state is not JobState.RUNNING:
             return job  # finished, failed or cancelled by someone else
+        if should_pause is not None and should_pause():
+            # A boundary: the previous step is committed and the next has not started, so the
+            # log is consistent. Nothing but the state move is written.
+            await store.append_group(
+                [state_change(JobState.RUNNING, JobState.PAUSED, "paused by user")]
+            )
+            return await _current()
         n = log.next_step
         attempt = log.started[n]
         if attempt >= max_attempts_per_step:
