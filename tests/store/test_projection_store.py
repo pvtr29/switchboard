@@ -324,7 +324,14 @@ def generate(ops: Sequence[tuple[int, int]]) -> list[Event]:
         elif kind == "lease_lost":
             out.append(mk(job, T.LEASE_LOST, {"worker": "w"}))
         elif kind == "noise":
-            out.append(mk(job, T.EFFECT_INTENT, {"effect_id": str(choice)}))
+            payload = {
+                "effect_id": str(choice),
+                "kind": "k",
+                "args_hash": "h",
+                "policy": "keyed",
+                "step": 0,
+            }
+            out.append(mk(job, T.EFFECT_INTENT, payload))
         else:
             out.append(
                 mk(

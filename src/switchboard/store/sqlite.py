@@ -13,6 +13,7 @@ from switchboard.core import (
     Job,
     JobKind,
     JobState,
+    ProjectionError,
     Verdict,
     apply,
     budget_from_dict,
@@ -23,6 +24,7 @@ from switchboard.core import (
 from switchboard.store.interface import (
     AppendResult,
     AppendStatus,
+    EffectRecord,
     GroupResult,
     UnknownEventVersion,
 )
@@ -99,6 +101,53 @@ def _row_to_event(row: tuple[Any, ...]) -> Event:
         payload=json.loads(payload),
     )
 
+
+_EFFECT_STATUSES = frozenset({"applied", "reconciled", "interrupted"})
+
+
+def _effect_str(e: Event, key: str) -> str:
+    v = e.payload.get(key)
+    if not isinstance(v, str) or not v:
+        raise ProjectionError(f"{e.type.value} seq={e.seq}: payload.{key} must be a string")
+    return v
+
+
+def _project_effect(conn: sqlite3.Connection, e: Event) -> None:
+    """Fold an effect_intent / effect_outcome into the `effects` table (same transaction as
+    the event). Raises ProjectionError (a ValueError) for a bad payload, which rejects the
+    group. Only events actually inserted get here, so a duplicate intent never makes a second
+    row; ON CONFLICT DO NOTHING is belt and braces."""
+    effect_id = _effect_str(e, "effect_id")
+    if e.type is EventType.EFFECT_INTENT:
+        step = e.payload.get("step")
+        if not isinstance(step, int) or isinstance(step, bool) or step < 0:
+            raise ProjectionError(f"effect_intent seq={e.seq}: payload.step must be an int >= 0")
+        conn.execute(
+            "INSERT INTO effects (effect_id, job_id, step_id, kind, args_hash, status, policy) "
+            "VALUES (?, ?, ?, ?, ?, 'intent', ?) ON CONFLICT (effect_id) DO NOTHING",
+            (
+                effect_id,
+                e.job_id,
+                step,
+                _effect_str(e, "kind"),
+                _effect_str(e, "args_hash"),
+                _effect_str(e, "policy"),
+            ),
+        )
+        return
+    status = _effect_str(e, "status")
+    outcome = e.payload.get("outcome")
+    if status not in _EFFECT_STATUSES or not isinstance(outcome, Mapping):
+        raise ProjectionError(f"effect_outcome seq={e.seq}: bad status or outcome")
+    cur = conn.execute(
+        "UPDATE effects SET status = ?, outcome = ? WHERE effect_id = ? AND job_id = ?",
+        (status, _dump_payload(outcome), effect_id, e.job_id),
+    )
+    if cur.rowcount != 1:
+        raise ProjectionError(f"effect_outcome seq={e.seq}: no intent for effect {effect_id}")
+
+
+_EFFECT_EVENTS = frozenset({EventType.EFFECT_INTENT, EventType.EFFECT_OUTCOME})
 
 _Row = tuple[str, int, int | None, float, str, int, str]
 
@@ -257,6 +306,8 @@ class SQLiteEventLog:
                             continue
                         seq = int(got[0])
                         results.append(AppendResult(AppendStatus.INSERTED, seq))
+                        if event.type in _EFFECT_EVENTS:
+                            _project_effect(conn, event)
                         jid = event.job_id
                         if jid not in staged:
                             staged[jid] = self._lookup(pending, jid)
@@ -298,6 +349,25 @@ class SQLiteEventLog:
         ).fetchone()
         return None if row is None else _row_to_job(row)
 
+    def get_effect(self, effect_id: str) -> EffectRecord | None:
+        row = self._conn.execute(
+            "SELECT effect_id, job_id, step_id, kind, args_hash, policy, status, outcome "
+            "FROM effects WHERE effect_id = ?",
+            (effect_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return EffectRecord(
+            effect_id=row[0],
+            job_id=row[1],
+            step_id=row[2],
+            kind=row[3],
+            args_hash=row[4],
+            policy=row[5],
+            status=row[6],
+            outcome=None if row[7] is None else json.loads(row[7]),
+        )
+
     def list_jobs(self, state: JobState | None = None) -> list[Job]:
         if state is None:
             cur = self._conn.execute(f"SELECT {_JOB_COLUMNS} FROM jobs ORDER BY created_at, job_id")
@@ -318,11 +388,14 @@ class SQLiteEventLog:
         self._cache.clear()  # repopulated lazily from the new table
         conn.execute("BEGIN IMMEDIATE")
         try:
+            conn.execute("DELETE FROM effects")  # rebuilt below from the effect events
             jobs: dict[str, Job] = {}
             cur = conn.execute(f"SELECT {_COLUMNS} FROM events ORDER BY seq")
             while chunk := cur.fetchmany(1000):
                 for row in chunk:
                     e = _row_to_event(row)
+                    if e.type in _EFFECT_EVENTS:
+                        _project_effect(conn, e)
                     jobs[e.job_id] = apply(jobs.get(e.job_id), e)
             conn.execute("DELETE FROM jobs")
             conn.executemany(_UPSERT_JOB, [_job_to_row(j) for j in jobs.values()])

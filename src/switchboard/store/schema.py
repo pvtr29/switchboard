@@ -66,6 +66,19 @@ MIGRATIONS: tuple[str, ...] = (
     CREATE UNIQUE INDEX events_step ON events(job_id, type, step_id)
       WHERE step_id IS NOT NULL AND type <> 'step_started';
     """,
+    # 3: effect journal. Effect events carry no step_id, so events_step cannot dedupe them;
+    # instead two partial unique indexes over an expression on the payload's effect_id make
+    # "one intent and one outcome per effect" a database fact (an index on an expression is
+    # simpler than a generated column and needs no table rewrite). The effects projection
+    # also remembers the policy stored with the intent: it is never upgraded afterwards.
+    # DEFAULT 'unsafe' is the conservative value for any row without a recorded policy.
+    """
+    CREATE UNIQUE INDEX events_effect_intent ON events(json_extract(payload, '$.effect_id'))
+      WHERE type = 'effect_intent';
+    CREATE UNIQUE INDEX events_effect_outcome ON events(json_extract(payload, '$.effect_id'))
+      WHERE type = 'effect_outcome';
+    ALTER TABLE effects ADD COLUMN policy TEXT NOT NULL DEFAULT 'unsafe';
+    """,
 )
 
 SCHEMA_VERSION = len(MIGRATIONS)

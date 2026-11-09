@@ -1,9 +1,9 @@
 """Store interface the rest of the system depends on (SQLite now, Postgres in phase 5)."""
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol
+from typing import Any, Protocol
 
 from switchboard.core import Event, Job, JobState
 
@@ -25,6 +25,25 @@ type GroupResult = list[AppendResult] | Exception
 """Per-group outcome of `append_groups`: results in input order, or the reason it was rejected."""
 
 
+@dataclass(frozen=True, slots=True)
+class EffectRecord:
+    """One row of the `effects` projection. `status` is `intent` until an outcome is recorded,
+    then the outcome's status (applied, reconciled or interrupted)."""
+
+    effect_id: str
+    job_id: str
+    step_id: int
+    kind: str
+    args_hash: str
+    policy: str
+    status: str
+    outcome: Mapping[str, Any] | None
+
+    @property
+    def has_outcome(self) -> bool:
+        return self.status != "intent"
+
+
 class UnknownEventVersion(Exception):
     """An event has a type or payload version this code does not know."""
 
@@ -43,5 +62,7 @@ class EventLog(Protocol):
     def get_job(self, job_id: str) -> Job | None: ...
 
     def list_jobs(self, state: JobState | None = None) -> list[Job]: ...
+
+    def get_effect(self, effect_id: str) -> EffectRecord | None: ...
 
     def rebuild(self) -> int: ...

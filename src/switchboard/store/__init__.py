@@ -3,6 +3,7 @@
 from switchboard.store.interface import (
     AppendResult,
     AppendStatus,
+    EffectRecord,
     EventLog,
     GroupResult,
     UnknownEventVersion,
@@ -16,6 +17,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "AppendResult",
     "AppendStatus",
+    "EffectRecord",
     "EventLog",
     "EventStore",
     "GroupResult",

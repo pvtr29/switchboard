@@ -59,6 +59,7 @@ from switchboard.runtime.agent import (
     StepContext,
     ToolCall,
 )
+from switchboard.runtime.effects import EffectJournal, ExternalSink
 from switchboard.store import AppendStatus, EventStore
 
 REASON_CONFIG_CHANGED = "config changed"
@@ -180,6 +181,7 @@ async def run_job(
     env: Environment | None = None,
     keep_last: int = 2,
     should_pause: Callable[[], bool] | None = None,
+    sink: ExternalSink | None = None,
 ) -> Job:
     """Run `job_id` until it is verifying, failed, or no longer ours; return its projection.
 
@@ -194,6 +196,10 @@ async def run_job(
     `should_pause` is polled at every step boundary, before `step_started` of the next step
     (including the first). When it returns True the runner appends running -> paused and
     returns the paused job. It is cooperative: a step in flight always commits first.
+
+    `sink` enables `ctx.effect`: each step attempt gets an `EffectJournal` over it (see
+    runtime/effects.py). Effects are reconciled lazily, when the re-run act phase reaches the
+    same `ctx.effect` call; restoring S(n) does not undo them.
     """
     job = await store.get_job(job_id)
     if job is None:
@@ -301,6 +307,11 @@ async def run_job(
             budget=job.budget,
             usage=job.usage,
             workdir=env.workdir if env is not None else None,
+            effects=(
+                EffectJournal(store, sink, job_id=job_id, step=n, epoch=epoch, clock=clock)
+                if sink is not None
+                else None
+            ),
         )
         history = log.history()
 

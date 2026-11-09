@@ -37,7 +37,7 @@ from types import TracebackType
 from typing import Self
 
 from switchboard.core import Event, Job, JobState
-from switchboard.store.interface import AppendResult, AppendStatus
+from switchboard.store.interface import AppendResult, AppendStatus, EffectRecord
 from switchboard.store.sqlite import SQLiteEventLog, encode_event, open_db
 
 
@@ -280,6 +280,9 @@ class EventStore:
 
     async def get_job(self, job_id: str) -> Job | None:
         return await self._read("get_job", job_id)
+
+    async def get_effect(self, effect_id: str) -> EffectRecord | None:
+        return await self._read("get_effect", effect_id)
 
     async def list_jobs(self, state: JobState | None = None) -> list[Job]:
         return await self._read("list_jobs", state)

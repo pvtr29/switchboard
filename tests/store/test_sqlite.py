@@ -66,20 +66,20 @@ def jlog(log: SQLiteEventLog) -> SQLiteEventLog:
 
 def test_migrate_fresh_creates_everything(tmp_path: Path) -> None:
     with closing(sqlite3.connect(tmp_path / "raw.db", isolation_level=None)) as conn:
-        assert migrate(conn) == 2 == SCHEMA_VERSION
+        assert migrate(conn) == 3 == SCHEMA_VERSION
         names = {
             r[0]
             for r in conn.execute("SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")
         }
         assert {"schema_version", "events", "snapshots", "effects", "jobs"} <= names
         assert {"events_job", "events_step"} <= names
-        assert conn.execute("SELECT version FROM schema_version").fetchall() == [(2,)]
+        assert conn.execute("SELECT version FROM schema_version").fetchall() == [(3,)]
 
 
 def test_migrate_twice_is_noop(tmp_path: Path) -> None:
     with closing(sqlite3.connect(tmp_path / "raw.db", isolation_level=None)) as conn:
         migrate(conn)
-        assert migrate(conn) == 2
+        assert migrate(conn) == 3
         assert conn.execute("SELECT COUNT(*) FROM schema_version").fetchone() == (1,)
 
 
@@ -281,8 +281,8 @@ def test_migration_2_upgrades_a_v1_database(tmp_path: Path) -> None:
                 "INSERT INTO events (job_id, epoch, step_id, ts, type, v, payload) "
                 "VALUES ('j', 0, 1, 1.0, 'llm_responded', 1, '{}')"
             )
-        assert migrate(conn) == 2
-        assert conn.execute("SELECT version FROM schema_version").fetchall() == [(2,)]
+        assert migrate(conn) == 3
+        assert conn.execute("SELECT version FROM schema_version").fetchall() == [(3,)]
         assert conn.execute("SELECT COUNT(*) FROM events").fetchone() == (1,)
         conn.execute(
             "INSERT INTO events (job_id, epoch, step_id, ts, type, v, payload) "

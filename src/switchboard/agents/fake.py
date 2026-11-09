@@ -15,6 +15,7 @@ from typing import Any
 from switchboard.core import Usage
 from switchboard.runtime.agent import (
     ActResult,
+    EffectResult,
     Message,
     ModelResponse,
     ReplayPolicy,
@@ -22,6 +23,7 @@ from switchboard.runtime.agent import (
     ToolCall,
     ToolSpec,
 )
+from switchboard.runtime.effects import ExternalSink, effect_key
 
 PROMPT_TOKENS = 50
 USD_MICROS_PER_TOKEN = 3
@@ -133,7 +135,15 @@ class FakeAgent:
         fail_at_step: int | None = None,
         on_token: TokenHook | None = None,
         on_file_write: FileWriteHook | None = None,
+        effect_every: int = 0,
+        effect_policy: ReplayPolicy = ReplayPolicy.KEYED,
+        naive_sink: ExternalSink | None = None,
     ) -> None:
+        self.effect_every = effect_every
+        self.effect_policy = effect_policy
+        self.naive_sink = naive_sink
+        self.effect_results: list[EffectResult] = []
+        """Every result `ctx.effect` returned, in call order (across attempts of this object)."""
         self.on_file_write = on_file_write
         self.steps = steps
         self.fail_at_step = fail_at_step
@@ -186,6 +196,21 @@ class FakeAgent:
             await effect("append_file", "log.txt", f"step {ctx.step} n{r.randint(0, 9999)}")
         return out
 
+    async def _external_effect(self, ctx: StepContext, response: ModelResponse) -> dict[str, Any]:
+        """One external effect ("send") whose args come from the logged response, not the rng
+        (same reason as the file edits). With `naive_sink` the journal is bypassed: the sink is
+        called directly with the same key, which is what resume-from-scratch would do."""
+        digest = hashlib.sha256(json.dumps(response.message, sort_keys=True).encode()).hexdigest()
+        args = {"to": f"user{int(digest[:4], 16) % 5}", "body": digest[:12], "step": ctx.step}
+        if self.naive_sink is not None:
+            key = effect_key(ctx.job_id, ctx.step, 0, args)
+            out = await self.naive_sink.apply(key, "send", args)
+            return {"role": "tool", "name": "send", "content": dict(out)}
+        res = await ctx.effect("send", args, policy=self.effect_policy)
+        self.effect_results.append(res)
+        content: Any = "interrupted" if res.interrupted else dict(res.outcome)
+        return {"role": "tool", "name": "send", "content": content}
+
     async def act(self, ctx: StepContext, response: ModelResponse) -> ActResult:
         self.act_calls.append((ctx.step, ctx.attempt))
         if ctx.step == self.fail_at_step:
@@ -201,5 +226,7 @@ class FakeAgent:
         )
         if ctx.workdir is not None:
             results = (*results, *await self._file_effects(ctx, response))
+        if self.effect_every and ctx.step % self.effect_every == 0:
+            results = (*results, await self._external_effect(ctx, response))
         done = ctx.step + 1 >= self.steps
         return ActResult(messages=results, done=done, summary=f"step {ctx.step} done")

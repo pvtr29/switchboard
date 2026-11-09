@@ -55,6 +55,7 @@ from types import MappingProxyType
 from switchboard.core import TERMINAL_STATES, Event, EventType, Job, JobState, ProjectionError
 from switchboard.env.base import Environment
 from switchboard.runtime.agent import Agent
+from switchboard.runtime.effects import ExternalSink
 from switchboard.runtime.runner import JobNotRunnable, run_job
 from switchboard.runtime.slots import SlotPool
 from switchboard.store import EventStore, StoreClosed
@@ -112,6 +113,7 @@ class Supervisor:
         store: EventStore,
         agent_factory: Callable[[Job], Agent],
         env_factory: Callable[[Job], Environment | None] | None = None,
+        sink_factory: Callable[[Job], ExternalSink | None] | None = None,
         *,
         clock: Callable[[], float] = time.time,
         max_running: int = 8,
@@ -121,6 +123,7 @@ class Supervisor:
         self._store = store
         self._agent_factory = agent_factory
         self._env_factory = env_factory
+        self._sink_factory = sink_factory
         self._clock = clock
         self._tasks: dict[str, asyncio.Task[Job]] = {}
         self._followups: set[asyncio.Task[None]] = set()
@@ -281,6 +284,7 @@ class Supervisor:
                 agent,
                 clock=self._clock,
                 env=env,
+                sink=self._sink_factory(job) if self._sink_factory is not None else None,
                 should_pause=lambda: job_id in self._pause_requested,
             )
         finally:
