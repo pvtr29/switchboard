@@ -4,6 +4,7 @@ from switchboard.store.interface import (
     AppendResult,
     AppendStatus,
     EventLog,
+    GroupResult,
     UnknownEventVersion,
 )
 from switchboard.store.schema import SCHEMA_VERSION, SchemaVersionError, migrate
@@ -17,6 +18,7 @@ __all__ = [
     "AppendStatus",
     "EventLog",
     "EventStore",
+    "GroupResult",
     "SQLiteEventLog",
     "SchemaVersionError",
     "StoreClosed",

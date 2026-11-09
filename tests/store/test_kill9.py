@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from switchboard.core import fold
 from switchboard.store import SQLiteEventLog, open_db
 
 BATCH = 10
@@ -22,11 +23,15 @@ WRITER = textwrap.dedent(
     from switchboard.store import SQLiteEventLog, open_db
 
     log = SQLiteEventLog(open_db(sys.argv[1]))
+    log.append_many([
+        Event(job_id="j", epoch=0, ts=0.0, type=EventType.JOB_CREATED,
+              payload={{"kind": "fake", "task_ref": "t", "budget": {{}}, "seed": 0}})
+    ])
     batch = 0
     while True:
         batch += 1
         log.append_many([
-            Event(job_id="j", epoch=0, ts=0.0, type=EventType.STATE_CHANGED,
+            Event(job_id="j", epoch=0, ts=0.0, type=EventType.USAGE_RECORDED,
                   payload={{"batch": batch, "i": i}})
             for i in range({BATCH})
         ])
@@ -63,7 +68,10 @@ def test_acked_batches_survive_kill9_and_no_batch_is_partial(tmp_path: Path) -> 
 
     log = SQLiteEventLog(open_db(db))
     try:
-        per_batch = Counter(e.payload["batch"] for e in log.read_since(0, limit=1_000_000))
+        events = log.read_since(0, limit=1_000_000)
+        per_batch = Counter(e.payload["batch"] for e in events if "batch" in e.payload)
+        # The projection commits atomically with its events: kill -9 cannot leave them apart.
+        assert {j.job_id: j for j in log.list_jobs()} == fold(events)
     finally:
         log.close()
 

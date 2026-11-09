@@ -7,8 +7,25 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-from switchboard.core import Event, EventType
-from switchboard.store.interface import AppendResult, AppendStatus, UnknownEventVersion
+from switchboard.core import (
+    Event,
+    EventType,
+    Job,
+    JobKind,
+    JobState,
+    Verdict,
+    apply,
+    budget_from_dict,
+    budget_to_dict,
+    usage_from_dict,
+    usage_to_dict,
+)
+from switchboard.store.interface import (
+    AppendResult,
+    AppendStatus,
+    GroupResult,
+    UnknownEventVersion,
+)
 from switchboard.store.schema import migrate
 
 # Current payload schema version per event type. Bump when a payload shape changes.
@@ -103,44 +120,218 @@ def encode_event(e: Event) -> _Row:
     return (e.job_id, e.epoch, e.step_id, e.ts, e.type.value, e.v, _dump_payload(e.payload))
 
 
+_JOB_COLUMNS = (
+    "job_id, kind, task_ref, state, verdict, budget, usage, owner, lease_until, epoch, "
+    "last_step, last_seq, created_at, updated_at"
+)
+_UPSERT_JOB = (
+    f"INSERT INTO jobs ({_JOB_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+    "ON CONFLICT (job_id) DO UPDATE SET "
+    + ", ".join(f"{c} = excluded.{c}" for c in _JOB_COLUMNS.split(", ")[1:])
+)
+
+
+_dumps = json.JSONEncoder(separators=(",", ":"), allow_nan=False).encode
+
+
+def _job_to_row(j: Job) -> tuple[Any, ...]:
+    return (
+        j.job_id,
+        j.kind.value,
+        j.task_ref,
+        j.state.value,
+        None if j.verdict is None else j.verdict.value,
+        _dumps(budget_to_dict(j.budget)),
+        _dumps(usage_to_dict(j.usage)),
+        j.owner,
+        j.lease_until,
+        j.epoch,
+        j.last_step,
+        j.last_seq,
+        j.created_at,
+        j.updated_at,
+    )
+
+
+def _row_to_job(row: tuple[Any, ...]) -> Job:
+    (job_id, kind, task_ref, state, verdict, budget, usage, owner, lease_until) = row[:9]
+    epoch, last_step, last_seq, created_at, updated_at = row[9:]
+    return Job(
+        job_id=job_id,
+        kind=JobKind(kind),
+        task_ref=task_ref,
+        state=JobState(state),
+        verdict=None if verdict is None else Verdict(verdict),
+        budget=budget_from_dict(json.loads(budget)),
+        usage=usage_from_dict(json.loads(usage)),
+        owner=owner,
+        lease_until=lease_until,
+        epoch=epoch,
+        last_step=last_step,
+        last_seq=last_seq,
+        created_at=created_at,
+        updated_at=updated_at,
+    )
+
+
+def _with_seq(e: Event, seq: int) -> Event:
+    # Much cheaper than dataclasses.replace on this hot path.
+    return Event(
+        seq=seq,
+        job_id=e.job_id,
+        epoch=e.epoch,
+        step_id=e.step_id,
+        ts=e.ts,
+        type=e.type,
+        v=e.v,
+        payload=e.payload,
+    )
+
+
 class SQLiteEventLog:
+    """Event log plus jobs projection over one connection owned by one thread.
+
+    Write-through job cache: `append_groups` keeps the projection of every job it has touched
+    in `self._cache`, so a batch does not re-read and re-decode jobs from SQLite. This is only
+    correct under the single-writer invariant: the jobs table is written ONLY by this log
+    object, on the writer thread (a log that has the cache assumes it is the only writer of the
+    database). The reader connection uses a separate SQLiteEventLog whose reads (`get_job`,
+    `list_jobs`) always go to the table and never to the cache. Code or tests that modify the
+    jobs table behind the log's back must call `rebuild()` (which clears the cache) or use a
+    fresh log. Any exception inside `append_groups` clears the cache entirely.
+    """
+
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
+        self._cache: dict[str, Job] = {}
 
     def append_many(self, events: Sequence[Event]) -> list[AppendResult]:
-        """Append a batch in one transaction; results are in input order.
-
-        Everything that can be rejected is checked before BEGIN, so a bad event never leaves
-        a partially written batch. Each row uses INSERT ... ON CONFLICT DO NOTHING so a
-        duplicate (job_id, step_id) only affects that row: a plain INSERT would abort the
-        whole transaction and fail unrelated callers sharing the batch. BEGIN IMMEDIATE takes
-        the write lock up front, so a busy database fails at BEGIN (honouring busy_timeout)
-        rather than midway when a deferred read lock cannot upgrade.
-        """
-        rows = [encode_event(e) for e in events]
-        if not rows:
+        """Append one group atomically (see `append_groups`); raises if it is rejected."""
+        if not events:
             return []
+        (outcome,) = self.append_groups([events])
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
 
-        results: list[AppendResult] = []
+    def append_groups(self, groups: Sequence[Sequence[Event]]) -> list[GroupResult]:
+        """Append groups in ONE transaction, projecting each into `jobs`; one outcome per group.
+
+        Each group runs in its own SAVEPOINT: its events are inserted (per-row ON CONFLICT DO
+        NOTHING, so a duplicate only affects that row), then the events actually inserted are
+        folded into the affected jobs (a duplicate was folded when first written). If the fold
+        raises ProjectionError the savepoint is rolled back and that group's exception is
+        returned in its slot; other groups are unaffected. A sqlite error aborts the whole
+        transaction and is raised.
+
+        Everything that can be rejected statelessly (encoding) is checked before BEGIN. Jobs
+        are loaded at most once per batch and written once at the end: BEGIN IMMEDIATE holds
+        the write lock, so the in-memory view cannot go stale, and a rejected group's changes
+        are only merged into the view after it succeeded.
+        """
+        encoded = [[encode_event(e) for e in g] for g in groups]
+        if not any(encoded):
+            return [[] for _ in groups]
+
         conn = self._conn
+        outcomes: list[GroupResult] = []
+        pending: dict[str, Job] = {}  # committed-by-savepoint, not yet by the transaction
         conn.execute("BEGIN IMMEDIATE")
         try:
-            for row in rows:
-                got = conn.execute(
-                    "INSERT INTO events (job_id, epoch, step_id, ts, type, v, payload) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING RETURNING seq",
-                    row,
-                ).fetchone()
-                if got is None:
-                    results.append(AppendResult(AppendStatus.DUPLICATE, None))
-                else:
-                    results.append(AppendResult(AppendStatus.INSERTED, int(got[0])))
+            for group, rows in zip(groups, encoded, strict=True):
+                if not rows:
+                    outcomes.append([])
+                    continue
+                conn.execute("SAVEPOINT grp")
+                results: list[AppendResult] = []
+                staged: dict[str, Job | None] = {}
+                try:
+                    for event, row in zip(group, rows, strict=True):
+                        got = conn.execute(
+                            "INSERT INTO events (job_id, epoch, step_id, ts, type, v, payload) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING RETURNING seq",
+                            row,
+                        ).fetchone()
+                        if got is None:
+                            results.append(AppendResult(AppendStatus.DUPLICATE, None))
+                            continue
+                        seq = int(got[0])
+                        results.append(AppendResult(AppendStatus.INSERTED, seq))
+                        jid = event.job_id
+                        if jid not in staged:
+                            staged[jid] = self._lookup(pending, jid)
+                        staged[jid] = apply(staged[jid], _with_seq(event, seq))
+                # ValueError, not just ProjectionError: any validation failure in the fold (e.g. a
+                # model __post_init__ check) must stay this group's problem, never abort the batch.
+                # sqlite3.Error is not a ValueError, so real database errors still abort.
+                except ValueError as exc:
+                    conn.execute("ROLLBACK TO grp")
+                    conn.execute("RELEASE grp")
+                    outcomes.append(exc)
+                    continue
+                conn.execute("RELEASE grp")
+                for jid, job in staged.items():
+                    if job is not None:
+                        pending[jid] = job
+                outcomes.append(results)
+            conn.executemany(_UPSERT_JOB, [_job_to_row(j) for j in pending.values()])
+            conn.execute("COMMIT")
+        except BaseException:
+            self._cache.clear()
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        self._cache.update(pending)
+        return outcomes
+
+    def _lookup(self, pending: dict[str, Job], job_id: str) -> Job | None:
+        job = pending.get(job_id) or self._cache.get(job_id)
+        if job is None:
+            job = self.get_job(job_id)
+            if job is not None:
+                self._cache[job_id] = job  # unchanged table row, so valid even if we roll back
+        return job
+
+    def get_job(self, job_id: str) -> Job | None:
+        row = self._conn.execute(
+            f"SELECT {_JOB_COLUMNS} FROM jobs WHERE job_id = ?", (job_id,)
+        ).fetchone()
+        return None if row is None else _row_to_job(row)
+
+    def list_jobs(self, state: JobState | None = None) -> list[Job]:
+        if state is None:
+            cur = self._conn.execute(f"SELECT {_JOB_COLUMNS} FROM jobs ORDER BY created_at, job_id")
+        else:
+            cur = self._conn.execute(
+                f"SELECT {_JOB_COLUMNS} FROM jobs WHERE state = ? ORDER BY created_at, job_id",
+                (state.value,),
+            )
+        return [_row_to_job(r) for r in cur.fetchall()]
+
+    def rebuild(self) -> int:
+        """Drop the jobs projection and re-fold every event in seq order; returns job count.
+
+        One transaction: readers see either the old or the new projection. Raises
+        ProjectionError (leaving the old projection) if the log itself cannot be folded.
+        """
+        conn = self._conn
+        self._cache.clear()  # repopulated lazily from the new table
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            jobs: dict[str, Job] = {}
+            cur = conn.execute(f"SELECT {_COLUMNS} FROM events ORDER BY seq")
+            while chunk := cur.fetchmany(1000):
+                for row in chunk:
+                    e = _row_to_event(row)
+                    jobs[e.job_id] = apply(jobs.get(e.job_id), e)
+            conn.execute("DELETE FROM jobs")
+            conn.executemany(_UPSERT_JOB, [_job_to_row(j) for j in jobs.values()])
             conn.execute("COMMIT")
         except BaseException:
             if conn.in_transaction:
                 conn.execute("ROLLBACK")
             raise
-        return results
+        return len(jobs)
 
     def read_since(self, after_seq: int, limit: int = 1000) -> list[Event]:
         cur = self._conn.execute(

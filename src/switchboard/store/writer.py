@@ -15,7 +15,9 @@ Group commit
 ------------
 Callers enqueue *groups* of events with a future. The writer task takes one group, drains more
 with ``get_nowait`` up to ``max_batch`` events, and commits them all in ONE transaction (one
-WAL write instead of one per caller), then resolves each future. A group is never split, so
+WAL write instead of one per caller), then resolves each future. The jobs projection is
+updated in that same transaction; a group whose events cannot be folded is rolled back alone
+(savepoint) and only its caller gets the exception. A group is never split, so
 ``append_group`` is atomic. A group larger than ``max_batch`` is committed whole on its own.
 Acks are sent only after COMMIT returned.
 
@@ -34,7 +36,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Self
 
-from switchboard.core import Event
+from switchboard.core import Event, Job, JobState
 from switchboard.store.interface import AppendResult, AppendStatus
 from switchboard.store.sqlite import SQLiteEventLog, encode_event, open_db
 
@@ -58,6 +60,7 @@ class StoreStats:
     transactions: int
     events_written: int
     duplicates: int
+    rejected_groups: int
     max_batch_seen: int
     queue_depth: int
 
@@ -95,6 +98,7 @@ class EventStore:
         self._transactions = 0
         self._events_written = 0
         self._duplicates = 0
+        self._rejected_groups = 0
         self._max_batch_seen = 0
         self._close_lock = asyncio.Lock()
 
@@ -143,8 +147,10 @@ class EventStore:
     async def append_group(self, events: Sequence[Event]) -> list[AppendResult]:
         """Append events atomically (same transaction); results are in input order.
 
-        Raises ValueError (for this caller only) if any event is invalid, StoreClosed after
-        close, WriterCrashed if the writer died.
+        Raises ValueError (for this caller only) if any event is invalid, ProjectionError (a
+        ValueError; nothing from the group is written, other callers are unaffected) if the
+        events cannot be folded into the job projection, StoreClosed after close,
+        WriterCrashed if the writer died.
         """
         group = list(events)
         for e in group:
@@ -191,9 +197,9 @@ class EventStore:
                 batch.append(item)
                 count += len(item[0])
             self._inflight = batch
-            flat = [e for group, _ in batch for e in group]
+            groups = [group for group, _ in batch]
             try:
-                results = await loop.run_in_executor(self._wexec, self._log.append_many, flat)
+                outcomes = await loop.run_in_executor(self._wexec, self._log.append_groups, groups)
             except Exception as exc:
                 # e.g. disk error: the transaction rolled back, so nothing in it was written.
                 for _, fut in batch:
@@ -204,18 +210,25 @@ class EventStore:
                     return
                 continue
             # An invariant violation here is a bug: let it kill the writer (see the callback).
-            if len(results) != len(flat):
-                raise RuntimeError(f"append_many returned {len(results)} results for {len(flat)}")
+            if len(outcomes) != len(batch):
+                raise RuntimeError(
+                    f"append_groups returned {len(outcomes)} for {len(batch)} groups"
+                )
             self._transactions += 1
-            self._events_written += sum(r.status is AppendStatus.INSERTED for r in results)
-            self._duplicates += sum(r.status is AppendStatus.DUPLICATE for r in results)
             self._max_batch_seen = max(self._max_batch_seen, count)
-            pos = 0
-            for group, fut in batch:
-                part = results[pos : pos + len(group)]
-                pos += len(group)
+            for (group, fut), outcome in zip(batch, outcomes, strict=True):
+                if isinstance(outcome, Exception):
+                    # Projection-invalid group: nothing of it was written; others committed.
+                    self._rejected_groups += 1
+                    if not fut.done():
+                        fut.set_exception(outcome)
+                    continue
+                if len(outcome) != len(group):
+                    raise RuntimeError("append_groups returned a wrong number of results")
+                self._events_written += sum(r.status is AppendStatus.INSERTED for r in outcome)
+                self._duplicates += sum(r.status is AppendStatus.DUPLICATE for r in outcome)
                 if not fut.done():  # a cancelled caller no longer wants its ack
-                    fut.set_result(part)
+                    fut.set_result(outcome)
             self._inflight = []
             if stop:
                 return
@@ -265,12 +278,19 @@ class EventStore:
     async def last_seq(self) -> int:
         return await self._read("last_seq")
 
+    async def get_job(self, job_id: str) -> Job | None:
+        return await self._read("get_job", job_id)
+
+    async def list_jobs(self, state: JobState | None = None) -> list[Job]:
+        return await self._read("list_jobs", state)
+
     @property
     def stats(self) -> StoreStats:
         return StoreStats(
             transactions=self._transactions,
             events_written=self._events_written,
             duplicates=self._duplicates,
+            rejected_groups=self._rejected_groups,
             max_batch_seen=self._max_batch_seen,
             queue_depth=self._queue.qsize(),
         )
