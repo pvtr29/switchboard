@@ -17,3 +17,7 @@ htmlcov/
 /var/
 
 .DS_Store
+
+# Local secrets and spike output
+.env
+spike/runs/

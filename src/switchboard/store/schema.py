@@ -1,0 +1,102 @@
+"""SQLite schema and forward-only migrations."""
+
+import sqlite3
+
+MIGRATIONS: tuple[str, ...] = (
+    # 1: tables exactly as in docs/plan.md "Data model". Only `events` is used so far; the
+    # others exist so later commits do not need a schema change for them.
+    """
+    CREATE TABLE schema_version (
+      version INTEGER NOT NULL CHECK (version >= 1)
+    ) STRICT;
+
+    CREATE TABLE events (
+      seq     INTEGER PRIMARY KEY AUTOINCREMENT,
+      job_id  TEXT NOT NULL,
+      epoch   INTEGER NOT NULL CHECK (epoch >= 0),
+      step_id INTEGER CHECK (step_id IS NULL OR step_id >= 0),
+      ts      REAL NOT NULL,
+      type    TEXT NOT NULL,
+      v       INTEGER NOT NULL CHECK (v >= 1),
+      payload TEXT NOT NULL
+    ) STRICT;
+    CREATE INDEX events_job ON events(job_id, seq);
+    CREATE UNIQUE INDEX events_step ON events(job_id, step_id) WHERE step_id IS NOT NULL;
+
+    CREATE TABLE snapshots (
+      job_id      TEXT NOT NULL,
+      step_id     INTEGER NOT NULL CHECK (step_id >= 0),
+      agent_state BLOB NOT NULL,
+      env_ref     TEXT NOT NULL,
+      PRIMARY KEY (job_id, step_id)
+    ) STRICT;
+
+    CREATE TABLE effects (
+      effect_id TEXT PRIMARY KEY,
+      job_id    TEXT NOT NULL,
+      step_id   INTEGER NOT NULL CHECK (step_id >= 0),
+      kind      TEXT NOT NULL,
+      args_hash TEXT NOT NULL,
+      status    TEXT NOT NULL,
+      outcome   TEXT
+    ) STRICT;
+
+    CREATE TABLE jobs (
+      job_id      TEXT PRIMARY KEY,
+      kind        TEXT NOT NULL,
+      task_ref    TEXT NOT NULL,
+      state       TEXT NOT NULL,
+      verdict     TEXT,
+      budget      TEXT NOT NULL,
+      usage       TEXT NOT NULL,
+      owner       TEXT,
+      lease_until REAL,
+      epoch       INTEGER NOT NULL DEFAULT 0 CHECK (epoch >= 0),
+      last_step   INTEGER,
+      last_seq    INTEGER NOT NULL,
+      created_at  REAL NOT NULL,
+      updated_at  REAL NOT NULL
+    ) STRICT;
+    """,
+)
+
+SCHEMA_VERSION = len(MIGRATIONS)
+
+
+class SchemaVersionError(RuntimeError):
+    """The database was written by a newer version of the code."""
+
+
+def current_version(conn: sqlite3.Connection) -> int:
+    has_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'"
+    ).fetchone()
+    if has_table is None:
+        return 0
+    row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+    return int(row[0]) if row is not None and row[0] is not None else 0
+
+
+def migrate(conn: sqlite3.Connection) -> int:
+    """Apply pending migrations and return the resulting version. Idempotent.
+
+    Each migration and its version bump share one transaction, so a crash leaves either the
+    old version or the new one, never a half-applied schema. `executescript` does not join an
+    open transaction, so BEGIN/COMMIT are part of the script itself.
+    """
+    version = current_version(conn)
+    if version > SCHEMA_VERSION:
+        raise SchemaVersionError(
+            f"database schema version {version} is newer than supported version {SCHEMA_VERSION}"
+        )
+    for n, script in enumerate(MIGRATIONS[version:], start=version + 1):
+        try:
+            conn.executescript(
+                f"BEGIN IMMEDIATE;\n{script}\nDELETE FROM schema_version;\n"
+                f"INSERT INTO schema_version (version) VALUES ({int(n)});\nCOMMIT;"
+            )
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+    return SCHEMA_VERSION
