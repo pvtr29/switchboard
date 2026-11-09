@@ -1,0 +1,56 @@
+[project]
+name = "switchboard"
+version = "0.1.0"
+description = "Durable runtime for long-running LLM agent rollouts: crash-safe, snapshot-able environments, verified results."
+authors = [
+    { name = "pvtr29", email = "pandeypavitra65@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+sb = "switchboard.client.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "looptime>=0.9",
+    "mypy>=2.4.1",
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.4.1.post1",
+    "ruff>=0.17.4",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # isort
+    "B",        # bugbear
+    "UP",       # pyupgrade
+    "SIM",      # simplify
+    "RUF",      # ruff-specific
+    "ASYNC",    # async pitfalls (blocking calls in async code, etc.)
+    "PT",       # pytest style
+]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+files = ["src", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+asyncio_debug = true
+addopts = ["--strict-markers", "--strict-config", "-ra"]
+# Any warning is a failure, including asyncio's "coroutine was never awaited".
+filterwarnings = ["error"]

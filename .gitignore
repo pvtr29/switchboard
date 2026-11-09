@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Runtime state written by the daemon during local runs
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+/var/
+
+.DS_Store
