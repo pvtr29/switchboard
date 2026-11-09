@@ -289,17 +289,23 @@ class Supervisor:
             task.cancel()
             await asyncio.wait({task})
         # Re-read: the task may have finished (or a concurrent cancel won) while we waited.
-        job = await self._store.get_job(job_id)
-        assert job is not None
-        if job.state in TERMINAL_STATES:
-            self._require_cancelled(job)
-            return
-        try:
-            await self._append_state(job, JobState.CANCELLED, reason)
-        except ProjectionError:
+        # The read can still be stale: a cancelled task's last group (e.g. queued ->
+        # provisioning -> running) may be queued in the writer, not yet committed, and would
+        # make our `<state> -> cancelled` illegal. The writer is FIFO, so once our append is
+        # rejected that group has committed: re-read and retry. Cancel is legal from every
+        # non-terminal state, so this converges; the bound only guards against a bug.
+        for _ in range(5):
             job = await self._store.get_job(job_id)
             assert job is not None
-            self._require_cancelled(job)  # lost a race: fine only if it ended cancelled
+            if job.state in TERMINAL_STATES:
+                self._require_cancelled(job)  # fine only if it ended cancelled
+                return
+            try:
+                await self._append_state(job, JobState.CANCELLED, reason)
+                return
+            except ProjectionError:
+                continue
+        raise RuntimeError(f"could not cancel job {job_id}: state kept changing")
 
     @staticmethod
     def _require_cancelled(job: Job) -> None:

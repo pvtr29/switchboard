@@ -407,3 +407,51 @@ async def test_resumed_queued_job_is_not_started_over(store: EventStore) -> None
     assert [e.step_id for e in events if e.type is T.STEP_COMPLETED] == [0, 1, 2, 3]
     assert [e.step_id for e in events if e.type is T.STEP_STARTED] == [0, 1, 2, 3]
     await sup.aclose()
+
+
+async def test_cancel_retries_when_its_read_is_stale(
+    store: EventStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression (seen on CI, py3.13): a cancelled task's last group (queued -> provisioning ->
+    # running) can still be in the writer queue when cancel() re-reads the job, so cancel()
+    # sees `queued` and appends `queued -> cancelled`, which is then illegal. cancel() must
+    # re-read and retry instead of raising NotCancellable.
+    await create_job(store, "j1")
+
+    def sc(src: JobState, dst: JobState) -> Event:
+        return Event(
+            job_id="j1",
+            epoch=0,
+            ts=1.0,
+            type=T.STATE_CHANGED,
+            payload={"from": src.value, "to": dst.value, "reason": "test"},
+        )
+
+    queued = await store.get_job("j1")
+    assert queued is not None
+    assert queued.state is JobState.QUEUED
+    await store.append_group(
+        [sc(JobState.QUEUED, JobState.PROVISIONING), sc(JobState.PROVISIONING, JobState.RUNNING)]
+    )
+    real_get_job = store.get_job
+    calls = 0
+
+    async def stale_once(job_id: str) -> object:
+        nonlocal calls
+        calls += 1
+        # cancel() reads twice before appending (existence check, then re-read): serve the
+        # stale `queued` both times, then the truth.
+        return queued if calls <= 2 else await real_get_job(job_id)
+
+    sup = Supervisor(store, lambda job: FakeAgent())
+    try:
+        monkeypatch.setattr(store, "get_job", stale_once)
+        await sup.cancel("j1", reason="stale read")
+        assert calls >= 3  # the stale append was rejected and cancel() re-read
+    finally:
+        monkeypatch.undo()
+        await sup.aclose()
+    assert await state_of(store, "j1") is JobState.CANCELLED
+    events = await assert_consistent(store, "j1")
+    last = [e for e in events if e.type is T.STATE_CHANGED][-1]
+    assert last.payload == {"from": "running", "to": "cancelled", "reason": "stale read"}
