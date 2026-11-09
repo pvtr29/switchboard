@@ -4,6 +4,7 @@ from typing import Any
 import pytest
 
 from switchboard.core import (
+    STEP_EVENT_TYPES,
     Budget,
     Dimension,
     Event,
@@ -24,7 +25,7 @@ def test_enum_values() -> None:
     assert Verdict.PASS_.value == "pass"
     assert {v.value for v in Verdict} == {"pass", "fail", "suspected_hack"}
     assert {k.value for k in JobKind} == {"fake", "rollout"}
-    assert len(EventType) == 12
+    assert len(EventType) == 15
     assert EventType.STEP_COMPLETED.value == "step_completed"
 
 
@@ -144,6 +145,21 @@ def test_event_step_completed_requires_step_id() -> None:
         make_event(type=EventType.STEP_COMPLETED)
     e = make_event(type=EventType.STEP_COMPLETED, step_id=0)
     assert e.step_id == 0
+
+
+@pytest.mark.parametrize(
+    "type_", [EventType.STEP_COMPLETED, EventType.LLM_RESPONDED, EventType.STEP_STARTED]
+)
+def test_event_step_id_required_on_step_types(type_: EventType) -> None:
+    with pytest.raises(ValueError, match="step_id"):
+        make_event(type=type_)
+    assert make_event(type=type_, step_id=2).step_id == 2
+
+
+@pytest.mark.parametrize("type_", [t for t in EventType if t not in STEP_EVENT_TYPES])
+def test_event_step_id_forbidden_on_non_step_types(type_: EventType) -> None:
+    with pytest.raises(ValueError, match="step_id"):
+        make_event(type=type_, step_id=0)
 
 
 def test_event_step_id_forbidden_on_other_types() -> None:

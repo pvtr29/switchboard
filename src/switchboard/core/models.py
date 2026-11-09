@@ -26,6 +26,9 @@ class EventType(StrEnum):
     JOB_CREATED = "job_created"
     STATE_CHANGED = "state_changed"
     STEP_COMPLETED = "step_completed"
+    LLM_RESPONDED = "llm_responded"
+    STEP_STARTED = "step_started"
+    RESTORED = "restored"
     USAGE_RECORDED = "usage_recorded"
     BUDGET_RESERVED = "budget_reserved"
     BUDGET_SETTLED = "budget_settled"
@@ -35,6 +38,12 @@ class EventType(StrEnum):
     LEASE_ACQUIRED = "lease_acquired"
     LEASE_LOST = "lease_lost"
     VERDICT_RECORDED = "verdict_recorded"
+
+
+STEP_EVENT_TYPES: frozenset[EventType] = frozenset(
+    {EventType.STEP_COMPLETED, EventType.LLM_RESPONDED, EventType.STEP_STARTED}
+)
+"""Event types that carry a step_id (and only these)."""
 
 
 class Dimension(StrEnum):
@@ -158,9 +167,11 @@ class Event:
             raise ValueError("epoch must be >= 0")
         if self.v < 1:
             raise ValueError("v must be >= 1")
-        is_step = self.type is EventType.STEP_COMPLETED
-        if is_step != (self.step_id is not None):
-            raise ValueError("step_id must be set if and only if type is step_completed")
+        if (self.type in STEP_EVENT_TYPES) != (self.step_id is not None):
+            raise ValueError(
+                "step_id must be set if and only if type is step_completed, llm_responded "
+                "or step_started"
+            )
         if self.step_id is not None and self.step_id < 0:
             raise ValueError("step_id must be >= 0")
         # Copy so the caller's dict cannot mutate a frozen event; frozen needs object.__setattr__.

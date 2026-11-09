@@ -4,6 +4,7 @@ from typing import Any
 import pytest
 
 from switchboard.core import (
+    STEP_EVENT_TYPES,
     Budget,
     Event,
     EventType,
@@ -107,7 +108,7 @@ def test_second_job_created_rejected() -> None:
 
 @pytest.mark.parametrize("type_", [t for t in EventType if t is not T.JOB_CREATED])
 def test_event_for_unknown_job_rejected(type_: EventType) -> None:
-    step = 0 if type_ is T.STEP_COMPLETED else None
+    step = 0 if type_ in STEP_EVENT_TYPES else None
     with pytest.raises(ProjectionError, match="does not exist"):
         apply(None, ev(type_, step=step))
 
@@ -343,3 +344,17 @@ def test_json_helpers_roundtrip() -> None:
     for bad in ("x", {"tokens": "1"}, {"active_seconds": -1}):
         with pytest.raises(ProjectionError):
             usage_from_dict(bad)
+
+
+@pytest.mark.parametrize("type_", [T.LLM_RESPONDED, T.STEP_STARTED, T.RESTORED])
+def test_runtime_bookkeeping_events_change_nothing_but_seq(type_: EventType) -> None:
+    job = created()
+    step = 3 if type_ in STEP_EVENT_TYPES else None
+    after = apply(job, ev(type_, {"anything": 1}, seq=2, step=step, ts=11.0))
+    assert after == dataclasses.replace(job, last_seq=2, updated_at=11.0)
+    assert after.last_step is None
+
+
+def test_job_created_accepts_instructions_and_config_hash() -> None:
+    payload = {**CREATED, "instructions": [{"role": "user", "content": "x"}], "config_hash": "h"}
+    assert apply(None, ev(T.JOB_CREATED, payload)).task_ref == "task-1"

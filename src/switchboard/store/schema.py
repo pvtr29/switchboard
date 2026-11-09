@@ -58,6 +58,14 @@ MIGRATIONS: tuple[str, ...] = (
       updated_at  REAL NOT NULL
     ) STRICT;
     """,
+    # 2: llm_responded and step_started now carry a step_id too, so uniqueness widens to
+    # (job_id, type, step_id): one llm_responded and one step_completed per step. step_started
+    # is exempt: it is written once per attempt and its count is the restart counter.
+    """
+    DROP INDEX events_step;
+    CREATE UNIQUE INDEX events_step ON events(job_id, type, step_id)
+      WHERE step_id IS NOT NULL AND type <> 'step_started';
+    """,
 )
 
 SCHEMA_VERSION = len(MIGRATIONS)

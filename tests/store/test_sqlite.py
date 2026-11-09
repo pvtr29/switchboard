@@ -66,20 +66,20 @@ def jlog(log: SQLiteEventLog) -> SQLiteEventLog:
 
 def test_migrate_fresh_creates_everything(tmp_path: Path) -> None:
     with closing(sqlite3.connect(tmp_path / "raw.db", isolation_level=None)) as conn:
-        assert migrate(conn) == 1 == SCHEMA_VERSION
+        assert migrate(conn) == 2 == SCHEMA_VERSION
         names = {
             r[0]
             for r in conn.execute("SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")
         }
         assert {"schema_version", "events", "snapshots", "effects", "jobs"} <= names
         assert {"events_job", "events_step"} <= names
-        assert conn.execute("SELECT version FROM schema_version").fetchall() == [(1,)]
+        assert conn.execute("SELECT version FROM schema_version").fetchall() == [(2,)]
 
 
 def test_migrate_twice_is_noop(tmp_path: Path) -> None:
     with closing(sqlite3.connect(tmp_path / "raw.db", isolation_level=None)) as conn:
         migrate(conn)
-        assert migrate(conn) == 1
+        assert migrate(conn) == 2
         assert conn.execute("SELECT COUNT(*) FROM schema_version").fetchone() == (1,)
 
 
@@ -261,3 +261,60 @@ def test_persistence_across_reopen(tmp_path: Path) -> None:
 def test_satisfies_protocol(log: SQLiteEventLog) -> None:
     store: EventLog = log
     assert store.last_seq() == 0
+
+
+def test_migration_2_upgrades_a_v1_database(tmp_path: Path) -> None:
+    from switchboard.store.schema import MIGRATIONS
+
+    path = tmp_path / "v1.db"
+    with closing(sqlite3.connect(path, isolation_level=None)) as conn:
+        conn.executescript(
+            f"BEGIN;\n{MIGRATIONS[0]}\nINSERT INTO schema_version (version) VALUES (1);\nCOMMIT;"
+        )
+        conn.execute(
+            "INSERT INTO events (job_id, epoch, step_id, ts, type, v, payload) "
+            "VALUES ('j', 0, 1, 1.0, 'step_completed', 1, '{}')"
+        )
+        # v1 index: step_id alone is unique per job, so llm_responded(1) would collide.
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO events (job_id, epoch, step_id, ts, type, v, payload) "
+                "VALUES ('j', 0, 1, 1.0, 'llm_responded', 1, '{}')"
+            )
+        assert migrate(conn) == 2
+        assert conn.execute("SELECT version FROM schema_version").fetchall() == [(2,)]
+        assert conn.execute("SELECT COUNT(*) FROM events").fetchone() == (1,)
+        conn.execute(
+            "INSERT INTO events (job_id, epoch, step_id, ts, type, v, payload) "
+            "VALUES ('j', 0, 1, 1.0, 'llm_responded', 1, '{}')"
+        )
+
+
+def _step_ev(type_: EventType, step: int) -> Event:
+    return Event(job_id="j", epoch=0, step_id=step, ts=1.0, type=type_, payload={})
+
+
+def test_step_uniqueness_rules(jlog: SQLiteEventLog) -> None:
+    T = EventType
+    res = jlog.append_many(
+        [
+            _step_ev(T.STEP_STARTED, 0),
+            _step_ev(T.STEP_STARTED, 0),
+            _step_ev(T.STEP_STARTED, 0),
+            _step_ev(T.LLM_RESPONDED, 0),
+            _step_ev(T.LLM_RESPONDED, 0),
+            _step_ev(T.STEP_COMPLETED, 0),
+            _step_ev(T.STEP_COMPLETED, 0),
+            _step_ev(T.LLM_RESPONDED, 1),
+        ]
+    )
+    assert [r.status is AppendStatus.INSERTED for r in res] == [
+        True,
+        True,
+        True,
+        True,
+        False,
+        True,
+        False,
+        True,
+    ]

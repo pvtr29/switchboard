@@ -1,6 +1,7 @@
 """Pure domain logic: models, job state machine, projection fold. No I/O."""
 
 from switchboard.core.models import (
+    STEP_EVENT_TYPES,
     Budget,
     Dimension,
     Event,
@@ -30,6 +31,7 @@ from switchboard.core.states import (
 )
 
 __all__ = [
+    "STEP_EVENT_TYPES",
     "TERMINAL_STATES",
     "TRANSITIONS",
     "Budget",
