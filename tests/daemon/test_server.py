@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
-from conftest import wait_state
+from conftest import wait_listening, wait_state
 
 from switchboard.client.conn import Client, ClientError
 from switchboard.daemon.protocol import MAX_LINE_BYTES
@@ -181,10 +181,7 @@ async def test_shutdown_command_stops_the_daemon(sock_dir: Path, tmp_path: Path)
         shutdown_timeout=5.0,
     )
     runner = asyncio.create_task(d.run())
-    for _ in range(200):
-        if d.socket_path.exists():
-            break
-        await asyncio.sleep(0.01)
+    await wait_listening(d.socket_path)  # not path.exists(): the file appears before listen()
     async with await Client.connect(str(d.socket_path)) as c:
         job_id = (await c.request("submit", steps=300, token_interval=0.005))["job_id"]
         await wait_state(c, job_id, {"running"})

@@ -197,6 +197,24 @@ async def wait_steps(
             await asyncio.sleep(0.02)
 
 
+async def wait_listening(path: Path, within: float = 10.0) -> None:
+    """Async helper for in-process daemons: wait until the socket ACCEPTS connections.
+
+    The socket file appears at bind(), slightly before listen(); connecting in between is
+    refused on Linux, so checking `path.exists()` is racy.
+    """
+    async with asyncio.timeout(within):
+        while True:
+            try:
+                _reader, writer = await asyncio.open_unix_connection(str(path))
+            except OSError:
+                await asyncio.sleep(0.01)
+                continue
+            writer.close()
+            await writer.wait_closed()
+            return
+
+
 def wait_for_socket(path: Path, timeout: float = 10.0) -> None:
     """Sync helper for subprocess tests: wait until something accepts connections."""
     deadline = time.monotonic() + timeout
