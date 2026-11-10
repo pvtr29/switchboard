@@ -53,6 +53,9 @@ class ModelResponse:
     tool_calls: tuple[ToolCall, ...]
     usage: Usage
     model: str
+    meta: Mapping[str, Any] = field(default_factory=dict)
+    """Optional JSON-compatible facts about the call (retries, fallbacks, token breakdown,
+    latency). Logged in `llm_responded` and decoded back; the runtime never interprets it."""
 
 
 @dataclass(frozen=True, slots=True)

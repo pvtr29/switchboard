@@ -218,6 +218,7 @@ def _decode_response(e: Event) -> ModelResponse:
         ),
         usage=usage_from_dict(p["usage"]),
         model=p["model"],
+        meta=p.get("meta", {}),
     )
 
 
@@ -545,6 +546,7 @@ async def run_job(
                             ],
                             "usage": usage_to_dict(response.usage),
                             "model": response.model,
+                            **({"meta": dict(response.meta)} if response.meta else {}),
                             "config_hash": agent.config_hash,
                         },
                         n,

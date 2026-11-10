@@ -17,8 +17,16 @@ from switchboard.core import Event, EventType
 from switchboard.daemon.server import Daemon
 from switchboard.store import EventStore
 
+# Fixture repos hold their own failing tests; they are copied into temp dirs and run there.
+collect_ignore_glob = ["fixtures/*"]
+
 
 def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "live: calls a real provider API; skipped unless explicitly enabled (see "
+        "tests/agents/test_gemini.py); needs network and a key",
+    )
     config.addinivalue_line(
         "markers",
         "chaos: kill -9 chaos tests against a real daemon subprocess (see tests/chaos); "
