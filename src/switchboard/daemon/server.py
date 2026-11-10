@@ -40,6 +40,19 @@ BEFORE the server starts listening, so no client can observe the half-recovered 
 report is kept and exposed in `stats` ("recovery"). `verify_projection` (None = automatic, see
 recovery.py) is the consistency check of the live projection against a fold of the log.
 
+Real agents (phase 2): `agent="gemini"` with a `task` from the suite (switchboard.tasks)
+makes a `rollout` job: a GeminiAgent over a shared LLM client (one per model list, closed at
+shutdown), its `run_tests` tool in `runner_factory` (the macOS sandbox by default), a DirEnv
+from the task's repo. Without an explicit token budget such a job gets
+`default_rollout_tokens`.
+
+Grading: a store listener sees every `* -> verifying` commit of a job that has a task and
+starts a grading task (bounded by `max_running`): `verify.grader.grade` runs the visible and
+hidden tests in a fresh copy, then `verifying -> done` + `verdict_recorded` are appended as one
+group (a grader crash appends `verifying -> failed`). Grading tasks write nothing when
+cancelled, so a job whose grading was interrupted (shutdown, kill -9) is still `verifying` and
+is graded again at the next start (grading is a pure function of the final workdir).
+
 External sink for the chaos harness: `sink_db` gives every job a persistent `SQLiteSink` (its
 own SQLite file, so applications survive kill -9); `sink_naive` makes it non-idempotent. The
 extra `job_created` keys `effect_every`, `effect_policy` and (testing only) `exit_at_step` make
@@ -64,12 +77,15 @@ import socket
 import stat
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from switchboard.agents.fake import FakeAgent, TokenHook
+from switchboard.agents.gemini import GeminiAgent
+from switchboard.agents.gemini import instructions as task_instructions
+from switchboard.agents.tools import CommandRunner, LocalSandboxRunner
 from switchboard.core import (
     Budget,
     Event,
@@ -101,8 +117,9 @@ from switchboard.daemon.protocol import (
 )
 from switchboard.env.base import Environment
 from switchboard.env.dir_env import DirEnv
+from switchboard.llm.client import LLMClient
 from switchboard.obs import LoopLagMonitor
-from switchboard.runtime.agent import Agent, ReplayPolicy
+from switchboard.runtime.agent import Agent, ReplayPolicy, StepContext
 from switchboard.runtime.recovery import RecoveryReport, recover
 from switchboard.runtime.sinks import SQLiteSink
 from switchboard.runtime.supervisor import (
@@ -116,6 +133,8 @@ from switchboard.runtime.supervisor import (
     UnknownJob,
 )
 from switchboard.store import EventStore
+from switchboard.tasks import UnknownTask, load_task
+from switchboard.verify.grader import grade
 
 logger = logging.getLogger("switchboard.daemon")
 
@@ -125,6 +144,8 @@ MAX_SUBSCRIPTIONS_PER_CONNECTION = 64
 FLUSH_TIMEOUT_S = 2.0
 DEFAULT_SHUTDOWN_TIMEOUT_S = 10.0
 MAX_STEPS = 1_000_000
+AGENTS = ("fake", "gemini")
+DEFAULT_ROLLOUT_TOKENS = 200_000
 SLOW_CALLBACK_S = 0.05  # asyncio debug mode: log callbacks that hold the loop longer than this
 
 type Result = dict[str, Any]
@@ -152,6 +173,9 @@ class JobSpec:
     effect_every: int = 0
     effect_policy: str = ReplayPolicy.KEYED.value
     exit_at_step: int | None = None
+    agent: str = "fake"
+    task: str | None = None
+    models: tuple[str, ...] = ()
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "JobSpec":
@@ -163,6 +187,9 @@ class JobSpec:
             effect_every=int(payload.get("effect_every", 0)),
             effect_policy=str(payload.get("effect_policy", ReplayPolicy.KEYED.value)),
             exit_at_step=None if exit_at is None else int(exit_at),
+            agent=str(payload.get("agent", "fake")),
+            task=payload.get("task"),
+            models=tuple(payload.get("models", ())),
         )
 
 
@@ -435,8 +462,19 @@ class Daemon:
         lag_interval: float = 0.1,
         on_token: TokenHook | None = None,
         store_linger: float = 0.0,
+        api_key: str | None = None,
+        llm_factory: Callable[[tuple[str, ...]], LLMClient] | None = None,
+        runner_factory: Callable[[Path], CommandRunner] = LocalSandboxRunner,
+        default_rollout_tokens: int = DEFAULT_ROLLOUT_TOKENS,
     ) -> None:
         self.store_linger = store_linger
+        self._api_key = api_key
+        self._llm_factory = llm_factory
+        self.runner_factory = runner_factory
+        self.default_rollout_tokens = default_rollout_tokens
+        self._llms: dict[tuple[str, ...], LLMClient] = {}
+        self._grading: dict[str, asyncio.Task[None]] = {}
+        self._grade_slots = asyncio.Semaphore(max_running)
         self.debug_asyncio = debug_asyncio
         self.on_token = on_token
         self.lag = LoopLagMonitor(lag_interval)
@@ -508,6 +546,7 @@ class Daemon:
             self._store = await EventStore.open(self.db_path, linger=self.store_linger)
             self._bus = EventBus(queue_size=self._bus_queue_size)
             self._store.add_listener(self._bus.publish)
+            self._store.add_listener(self._on_commit)
             if self.sink_db is not None:
                 self._sink = await SQLiteSink.open(self.sink_db, idempotent=not self.sink_naive)
             self._supervisor = Supervisor(
@@ -526,6 +565,9 @@ class Daemon:
                 verify=self.verify_projection,
                 clock=self._clock,
             )
+            for job in await self._store.list_jobs(JobState.VERIFYING):
+                if job.kind is JobKind.ROLLOUT:  # fake jobs are never graded
+                    self._schedule_grading(job.job_id)
             self._server = await asyncio.start_unix_server(
                 self._on_connect, sock=sock, limit=MAX_LINE_BYTES
             )
@@ -607,6 +649,7 @@ class Daemon:
             if not await self._supervisor.wait_idle(self.shutdown_timeout):
                 logger.warning("jobs still running after %.1fs, cancelling", self.shutdown_timeout)
             await self._supervisor.aclose()  # cancels leftovers; writes nothing
+        await self._stop_grading()
         await asyncio.gather(*(c.close() for c in list(self._conns)))
         handlers = list(self._handlers)
         if handlers:
@@ -621,11 +664,19 @@ class Daemon:
         logger.info("shutdown complete")
 
     async def _release(self) -> None:
+        await self._stop_grading()
         await self.lag.stop()
+        llms, self._llms = list(self._llms.values()), {}
+        for llm in llms:
+            aclose = getattr(llm, "aclose", None)  # optional: not part of the LLMClient protocol
+            if aclose is not None:
+                with contextlib.suppress(Exception):
+                    await aclose()
         if self._bus is not None:
             self._bus.close()
         if self._store is not None:
             self._store.remove_listener(self.bus.publish)
+            self._store.remove_listener(self._on_commit)
             await self._store.aclose()
         if self._sink is not None:
             await self._sink.aclose()
@@ -647,6 +698,8 @@ class Daemon:
     # ---- factories ----------------------------------------------------------------------
     def _agent_factory(self, job: Job) -> Agent:
         spec = self._specs[job.job_id]
+        if spec.agent == "gemini":
+            return self._gemini_agent(spec.models)
         return FakeAgent(
             steps=spec.steps,
             token_interval=spec.token_interval,
@@ -660,8 +713,106 @@ class Daemon:
         return self._sink
 
     def _env_factory(self, job: Job) -> Environment | None:
-        template = self._specs[job.job_id].env_template
+        spec = self._specs[job.job_id]
+        template = str(load_task(spec.task).repo) if spec.task else spec.env_template
         return DirEnv(Path(template), self.envs_dir, job.job_id) if template else None
+
+    # ---- real agents --------------------------------------------------------------------
+    def _llm(self, models: tuple[str, ...]) -> LLMClient:
+        llm = self._llms.get(models)
+        if llm is None:
+            if self._llm_factory is not None:
+                llm = self._llm_factory(models)
+            else:
+                from switchboard.llm.gemini import DEFAULT_MODELS, GeminiClient
+
+                if not self._api_key:
+                    raise ProtocolError(BAD_ARGS, "the daemon has no Gemini API key")
+                llm = GeminiClient(models or DEFAULT_MODELS, api_key=self._api_key)
+            self._llms[models] = llm
+        return llm
+
+    def _gemini_agent(self, models: tuple[str, ...]) -> GeminiAgent:
+        def runner(ctx: StepContext) -> CommandRunner:
+            assert ctx.workdir is not None  # GeminiAgent checks before asking for a runner
+            return self.runner_factory(ctx.workdir)
+
+        return GeminiAgent(self._llm(models), runner)
+
+    # ---- grading ------------------------------------------------------------------------
+    def _on_commit(self, events: Sequence[Event]) -> None:
+        """Store listener (sync, on the loop): start grading jobs that just became verifying."""
+        if self._closing:
+            return
+        for e in events:
+            if e.type is EventType.STATE_CHANGED and e.payload.get("to") == "verifying":
+                spec = self._specs.get(e.job_id)
+                if spec is None or spec.task is not None:
+                    self._schedule_grading(e.job_id)
+
+    def _schedule_grading(self, job_id: str) -> None:
+        if job_id in self._grading or self._closing:
+            return
+        task = asyncio.create_task(self._grade(job_id), name=f"grade-{job_id}")
+        self._grading[job_id] = task
+        task.add_done_callback(lambda t: self._grading_done(job_id, t))
+
+    def _grading_done(self, job_id: str, task: asyncio.Task[None]) -> None:
+        if self._grading.get(job_id) is task:
+            del self._grading[job_id]
+        if not task.cancelled() and (exc := task.exception()) is not None:
+            logger.error("grading of %s crashed", job_id, exc_info=exc)
+
+    async def _stop_grading(self) -> None:
+        tasks = list(self._grading.values())
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.wait(tasks)
+
+    async def _grade(self, job_id: str) -> None:
+        await self._ensure_spec(job_id)
+        spec = self._specs[job_id]
+        if spec.task is None:
+            return  # fake jobs stay verifying: nothing to grade them against
+        async with self._grade_slots:
+            job = await self.store.get_job(job_id)
+            if job is None or job.state is not JobState.VERIFYING:
+                return
+            workdir = DirEnv(load_task(spec.task).repo, self.envs_dir, job_id).workdir
+            try:
+                result = await grade(load_task(spec.task), workdir, self.runner_factory)
+            except Exception as exc:
+                logger.exception("grading %s failed", job_id)
+                group = [
+                    self._event(
+                        job,
+                        EventType.STATE_CHANGED,
+                        {
+                            "from": "verifying",
+                            "to": "failed",
+                            "reason": f"grading failed: {type(exc).__name__}: {exc}",
+                        },
+                    )
+                ]
+            else:
+                group = [
+                    self._event(
+                        job,
+                        EventType.STATE_CHANGED,
+                        {"from": "verifying", "to": "done", "reason": "graded"},
+                    ),
+                    self._event(job, EventType.VERDICT_RECORDED, result.to_payload()),
+                ]
+            try:
+                await self.store.append_group(group)
+            except ProjectionError:
+                logger.warning("job %s moved on while it was graded; verdict dropped", job_id)
+
+    def _event(self, job: Job, type_: EventType, payload: dict[str, Any]) -> Event:
+        return Event(
+            job_id=job.job_id, epoch=job.epoch, ts=self._clock(), type=type_, payload=payload
+        )
 
     async def _ensure_spec(self, job_id: str) -> None:
         if job_id in self._specs:
@@ -716,17 +867,34 @@ class Daemon:
                 "effect_every",
                 "effect_policy",
                 "exit_at_step",
+                "agent",
+                "task",
+                "models",
             },
         )
         if self._closing:
             raise ProtocolError(CONFLICT, "daemon is shutting down")
-        if a.get("kind", "fake") != JobKind.FAKE.value:
-            raise ProtocolError(BAD_ARGS, "kind must be 'fake'")
-        task_ref = _str(a, "task_ref", required=False) or "fake"
+        agent = _str(a, "agent", required=False) or "fake"
+        if agent not in AGENTS:
+            raise ProtocolError(BAD_ARGS, f"agent must be one of {list(AGENTS)}")
+        kind = JobKind.FAKE if agent == "fake" else JobKind.ROLLOUT
+        if a.get("kind", kind.value) != kind.value:
+            raise ProtocolError(BAD_ARGS, f"kind must be {kind.value!r} for agent {agent!r}")
+        task_name = _str(a, "task", required=agent != "fake")
+        models = a.get("models", [])
+        if not isinstance(models, list) or not all(isinstance(m, str) and m for m in models):
+            raise ProtocolError(BAD_ARGS, "models must be a list of model names")
+        try:
+            task = load_task(task_name) if task_name is not None else None
+        except UnknownTask:
+            raise ProtocolError(BAD_ARGS, f"unknown task {task_name!r}") from None
+        task_ref = _str(a, "task_ref", required=False) or task_name or "fake"
         try:
             budget: Budget = budget_from_dict(a.get("budget", {}))
         except ProjectionError as exc:
             raise ProtocolError(BAD_ARGS, str(exc)) from exc
+        if kind is JobKind.ROLLOUT and budget.tokens is None:
+            budget = dataclasses.replace(budget, tokens=self.default_rollout_tokens)
         seed = _int(a, "seed", 0, -(2**53), 2**53)
         steps = _int(a, "steps", 5, 1, MAX_STEPS)
         interval = _num(a, "token_interval", 0.01, 0.0, 10.0)
@@ -743,6 +911,15 @@ class Daemon:
         instructions = a.get("instructions", [])
         if not isinstance(instructions, list) or not all(isinstance(m, dict) for m in instructions):
             raise ProtocolError(BAD_ARGS, "instructions must be a list of objects")
+        if task is not None:
+            if template is not None:
+                raise ProtocolError(BAD_ARGS, "a task brings its own environment: no env_template")
+            if not instructions:
+                instructions = task_instructions(task.prompt)
+        if agent == "fake":
+            config_hash = FakeAgent(steps=steps).config_hash
+        else:
+            config_hash = self._gemini_agent(tuple(models)).config_hash
         spec = JobSpec(
             steps=steps,
             token_interval=interval,
@@ -750,6 +927,9 @@ class Daemon:
             effect_every=effect_every,
             effect_policy=policy,
             exit_at_step=None if exit_at < 0 else exit_at,
+            agent=agent,
+            task=task_name,
+            models=tuple(models),
         )
         job_id = f"job-{uuid.uuid4().hex[:8]}"
         self._specs[job_id] = spec
@@ -761,18 +941,21 @@ class Daemon:
                     ts=self._clock(),
                     type=EventType.JOB_CREATED,
                     payload={
-                        "kind": JobKind.FAKE.value,
+                        "kind": kind.value,
                         "task_ref": task_ref,
                         "budget": budget_to_dict(budget),
                         "seed": seed,
                         "instructions": instructions,
-                        "config_hash": FakeAgent(steps=steps).config_hash,
+                        "config_hash": config_hash,
                         "steps": steps,
                         "token_interval": interval,
                         "env_template": template,
                         "effect_every": effect_every,
                         "effect_policy": policy,
                         "exit_at_step": spec.exit_at_step,
+                        "agent": agent,
+                        "task": task_name,
+                        "models": list(models),
                     },
                 )
             )

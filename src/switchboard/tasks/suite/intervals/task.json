@@ -1,0 +1,4 @@
+{
+  "prompt": "The test suite fails: `merge` in intervals.py does not merge some intervals it should. Fix the bug in intervals.py so the tests pass, without changing the tests.",
+  "editable": ["intervals.py"]
+}

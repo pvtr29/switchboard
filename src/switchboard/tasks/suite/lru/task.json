@@ -1,0 +1,4 @@
+{
+  "prompt": "The test suite fails: `LRUCache` in lru.py evicts the wrong entries. Fix the bug in lru.py so the tests pass, without changing the tests.",
+  "editable": ["lru.py"]
+}

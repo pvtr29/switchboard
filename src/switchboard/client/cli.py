@@ -4,6 +4,10 @@ The socket is `--socket`, else `$SB_SOCKET`, else `~/.switchboard/sb.sock`. `--s
 given before or after the subcommand. Exit status: 0 success, 1 the daemon answered with an
 error (or could not start), 2 the daemon is unreachable or usage is wrong, 130 `attach`
 detached with Ctrl-C (the job is not affected: attach only subscribes).
+
+Real agents: `sb submit --agent gemini --task roman` (tasks: `sb tasks`). The daemon needs a
+Gemini key: `GEMINI_API_KEY` / `GOOGLE_API_KEY` in its environment, else in the `--env-file`
+(default `.env` in the current directory). The key never goes through the socket.
 """
 
 from __future__ import annotations
@@ -24,10 +28,43 @@ from switchboard.obs.logging import configure_logging
 from switchboard.obs.tuning import tune_gc
 
 DEFAULT_HOME = "~/.switchboard"
-ATTACH_STOP_STATES = frozenset({"verifying", "done", "failed", "cancelled"})
+TERMINAL_STATES = frozenset({"done", "failed", "cancelled"})
+ATTACH_STOP_STATES = TERMINAL_STATES | {"verifying"}  # fake jobs are not graded
+KEY_VARS = ("GEMINI_API_KEY", "GOOGLE_API_KEY")
 EXIT_ERROR = 1
 EXIT_UNREACHABLE = 2
 EXIT_DETACHED = 130
+
+
+def read_env_file(path: Path) -> dict[str, str]:
+    """KEY=VALUE lines (optional `export `, quotes, `#` comments); a missing file is empty."""
+    try:
+        text = path.read_text("utf-8")
+    except FileNotFoundError:
+        return {}
+    out: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.removeprefix("export ").partition("=")
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        out[key.strip()] = value
+    return out
+
+
+def find_api_key(env: dict[str, str], env_file: Path) -> str | None:
+    """The process environment wins over the file; GEMINI_API_KEY before GOOGLE_API_KEY."""
+    for var in KEY_VARS:
+        if env.get(var):
+            return env[var]
+    file_vars = read_env_file(env_file)
+    for var in KEY_VARS:
+        if file_vars.get(var):
+            return file_vars[var]
+    return None
 
 
 def default_socket() -> str:
@@ -93,8 +130,24 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument(
         "--sink-naive", action="store_true", help="make the sink non-idempotent (baseline runs)"
     )
+    d.add_argument(
+        "--env-file",
+        default=".env",
+        metavar="PATH",
+        help="read GEMINI_API_KEY / GOOGLE_API_KEY from here if not in the environment "
+        "(default: .env)",
+    )
 
-    s = add("submit", "submit a fake job; prints its id")
+    s = add("submit", "submit a job (fake by default, or --agent gemini --task NAME)")
+    s.add_argument("--agent", choices=["fake", "gemini"], default="fake")
+    s.add_argument("--task", help="task from the suite (see `sb tasks`); needed for gemini")
+    s.add_argument(
+        "--model",
+        action="append",
+        dest="models",
+        metavar="NAME",
+        help="model to use, repeat for a fallback order (default: the client's list)",
+    )
     s.add_argument("--steps", type=int, default=5)
     s.add_argument("--seed", type=int, default=0)
     s.add_argument("--task-ref", default="fake")
@@ -125,6 +178,7 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--tokens", type=int, default=0)
     e.add_argument("--usd-micros", type=int, default=0)
     add("stats", "daemon statistics")
+    add("tasks", "list the SWE task suite (no daemon needed)")
     add("shutdown", "ask the daemon to shut down gracefully")
     return parser
 
@@ -171,8 +225,17 @@ def format_event(msg: dict[str, Any]) -> str:
             detail = f"step {e['step_id']}"
             if e["type"] == "step_completed" and p.get("done"):
                 detail += " (agent done)"
+            if e["type"] == "llm_responded" and p.get("tool_calls"):
+                detail += f" calls: {', '.join(c['name'] for c in p['tool_calls'])}"
         case "usage_recorded":
             detail = f"tokens={p.get('tokens_in', 0) + p.get('tokens_out', 0)}"
+        case "verdict_recorded":
+            detail = (
+                f"{p.get('verdict')} (tests passed={p.get('passed')} failed={p.get('failed')} "
+                f"errors={p.get('errors')})"
+            )
+            if p.get("ignored_changes"):
+                detail += f" ignored changes: {', '.join(p['ignored_changes'])}"
         case _:
             detail = json.dumps(p, separators=(",", ":"))[:80]
     return f"{e['seq']:>6}  {_clock(e['ts'])}  {e['job_id']}  {e['type']}  {detail}"
@@ -243,12 +306,14 @@ def _say(text: str) -> None:
 
 
 async def _attach(client: Client, job: str, live: bool) -> None:
+    kind = (await client.request("get", job_id=job))["job"]["kind"]
+    stop = ATTACH_STOP_STATES if kind == "fake" else TERMINAL_STATES  # rollouts get graded
     stream = await client.subscribe(job, from_seq=None if live else 1)
     async for msg in stream:
         _say(format_event(msg))
         if "event" in msg:
             e = msg["event"]
-            if e["type"] == "state_changed" and e["payload"].get("to") in ATTACH_STOP_STATES:
+            if e["type"] == "state_changed" and e["payload"].get("to") in stop:
                 return
 
 
@@ -264,6 +329,13 @@ async def _command(args: argparse.Namespace) -> int:
                 if args.budget_usd_micros is not None:
                     budget["usd_micros"] = args.budget_usd_micros
                 extra: dict[str, Any] = {}
+                if args.agent != "fake":
+                    extra["agent"] = args.agent
+                    extra["kind"] = "rollout"
+                if args.task:
+                    extra["task"] = args.task
+                if args.models:
+                    extra["models"] = args.models
                 if args.env_template:
                     extra["env_template"] = args.env_template  # made absolute in main()
                 if args.token_interval is not None:
@@ -272,10 +344,10 @@ async def _command(args: argparse.Namespace) -> int:
                     extra["effect_every"] = args.effect_every
                 if args.effect_policy is not None:
                     extra["effect_policy"] = args.effect_policy
+                extra.setdefault("kind", "fake")
                 r = await c.request(
                     "submit",
-                    kind="fake",
-                    task_ref=args.task_ref,
+                    task_ref=args.task or args.task_ref,
                     budget=budget,
                     seed=args.seed,
                     steps=args.steps,
@@ -323,6 +395,7 @@ def _run_daemon(args: argparse.Namespace) -> int:
         shutdown_timeout=args.shutdown_timeout,
         sink_db=args.sink_db,
         sink_naive=args.sink_naive,
+        api_key=find_api_key(dict(os.environ), Path(args.env_file)),
         verify_projection=args.verify_projection,
         debug_asyncio=args.debug_asyncio,
         store_linger=args.store_linger,
@@ -347,6 +420,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "daemon":
         return _run_daemon(args)
+    if args.command == "tasks":
+        from switchboard.tasks import load_task, task_names
+
+        for name in task_names():
+            _say(f"{name:<12} {load_task(name).prompt}")
+        return 0
     if args.command == "submit" and args.env_template:
         args.env_template = os.path.abspath(args.env_template)  # the daemon's cwd differs
     try:

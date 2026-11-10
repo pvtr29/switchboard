@@ -1,0 +1,4 @@
+{
+  "prompt": "The test suite fails: `slugify` in slug.py produces malformed slugs for some inputs. Fix the bug in slug.py so the tests pass, without changing the tests.",
+  "editable": ["slug.py"]
+}

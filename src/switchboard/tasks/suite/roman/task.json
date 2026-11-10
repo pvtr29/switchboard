@@ -1,0 +1,4 @@
+{
+  "prompt": "The test suite fails: `to_roman` in roman.py produces wrong numerals for some numbers. Fix the bug in roman.py so the tests pass, without changing the tests.",
+  "editable": ["roman.py"]
+}

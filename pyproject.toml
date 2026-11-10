@@ -30,6 +30,8 @@ dev = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# Task repos are data handed to agents (each is its own tiny project), not switchboard code.
+extend-exclude = ["src/switchboard/tasks/suite"]
 
 [tool.ruff.lint]
 select = [
@@ -48,6 +50,7 @@ select = [
 strict = true
 python_version = "3.12"
 files = ["src", "tests"]
+exclude = ["^src/switchboard/tasks/suite/"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
