@@ -51,6 +51,9 @@ daily provider quota) gets a timer that resumes it then (`paused -> queued`, rea
 "retry time reached"). Timers are rebuilt at start from each paused job's last state change,
 so they survive restarts; a manual resume or cancel first simply makes the timer a no-op.
 
+Every verdict also carries `monitor`: the action-only reward-hacking monitor
+(verify.monitor) over the job's logged tool calls, with its evidence. It is advisory.
+
 Grading: a store listener sees every `* -> verifying` commit of a job that has a task and
 starts a grading task (bounded by `max_running`): `verify.grader.grade` runs the visible and
 hidden tests in a fresh copy, then `verifying -> done` + `verdict_recorded` are appended as one
@@ -140,6 +143,7 @@ from switchboard.runtime.supervisor import (
 from switchboard.store import EventStore
 from switchboard.tasks import UnknownTask, load_task
 from switchboard.verify.grader import grade
+from switchboard.verify.monitor import actions_from_messages, scan
 
 logger = logging.getLogger("switchboard.daemon")
 
@@ -851,12 +855,25 @@ class Daemon:
                         EventType.STATE_CHANGED,
                         {"from": "verifying", "to": "done", "reason": "graded"},
                     ),
-                    self._event(job, EventType.VERDICT_RECORDED, result.to_payload()),
+                    self._event(
+                        job,
+                        EventType.VERDICT_RECORDED,
+                        result.to_payload() | {"monitor": await self._monitor(job_id)},
+                    ),
                 ]
             try:
                 await self.store.append_group(group)
             except ProjectionError:
                 logger.warning("job %s moved on while it was graded; verdict dropped", job_id)
+
+    async def _monitor(self, job_id: str) -> dict[str, Any]:
+        """The action-only monitor over the job's logged history (what the agent did, read from
+        the event log, which the agent cannot edit). Advisory: it never changes the verdict."""
+        history: list[Mapping[str, Any]] = []
+        for e in await self.store.read_job(job_id):
+            if e.type is EventType.STEP_COMPLETED:
+                history.extend(e.payload.get("delta", []))
+        return scan(actions_from_messages(history)).to_payload()
 
     def _event(self, job: Job, type_: EventType, payload: dict[str, Any]) -> Event:
         return Event(
