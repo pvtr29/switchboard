@@ -450,12 +450,14 @@ class ToolBox:
         if p == self.workdir.resolve():
             return ToolOutcome("path is the working directory", True)
 
-        def write() -> None:
+        def write() -> bool:
+            existed = p.exists()
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(contents, "utf-8")
+            return existed
 
-        await asyncio.to_thread(write)
-        return ToolOutcome(f"wrote {len(contents)} chars to {path}")
+        verb = "overwrote" if await asyncio.to_thread(write) else "created"
+        return ToolOutcome(f"{verb} {path} ({len(contents)} chars)")
 
     async def _list_files(self, path: str) -> ToolOutcome:
         base = resolve_in_workdir(self.workdir, path)

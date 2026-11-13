@@ -499,7 +499,9 @@ async def test_crash_after_llm_responded_replays_tools_without_a_new_call(
     assert len(by_type(events, EventType.LLM_RESPONDED)) == 5
     assert len(by_type(events, EventType.RESTORED)) == 1
     step2 = by_type(events, EventType.STEP_COMPLETED)[crash_step].payload["delta"]
-    assert step2[-1]["content"].startswith("wrote ")  # the tool call was re-executed
+    assert step2[-1]["content"].startswith(
+        ("created ", "overwrote ")
+    )  # the tool call was re-executed
 
 
 async def test_changed_agent_config_refuses_to_resume(store: EventStore, tmp_path: Path) -> None:

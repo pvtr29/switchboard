@@ -173,6 +173,9 @@ async def test_read_write_list_roundtrip(work: Path) -> None:
     out = await box.execute("write_file", {"path": "pkg/new.py", "contents": "y = 2\n"})
     assert not out.is_error
     assert (work / "pkg" / "new.py").read_text() == "y = 2\n"
+    assert out.content == "created pkg/new.py (6 chars)"
+    again = await box.execute("write_file", {"path": "pkg/new.py", "contents": "y = 3\n"})
+    assert again.content == "overwrote pkg/new.py (6 chars)"
     listing = (await box.execute("list_files", {})).content.splitlines()
     assert listing == ["a.py", "pkg/new.py", "tests/test_a.py"]
     sub = (await box.execute("list_files", {"path": "tests"})).content

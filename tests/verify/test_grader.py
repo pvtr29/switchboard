@@ -15,7 +15,14 @@ from rollout_fakes import PlainRunner
 from switchboard.agents.tools import SANDBOX_EXEC, LocalSandboxRunner
 from switchboard.core import Verdict
 from switchboard.tasks import UnknownTask, load_task, task_names
-from switchboard.verify.grader import Grade, changed_files, grade, parse_counts
+from switchboard.verify.grader import (
+    Grade,
+    changed_files,
+    grade,
+    parse_counts,
+    shadows_a_module,
+    split_changes,
+)
 
 TASKS = task_names()
 
@@ -99,6 +106,7 @@ async def test_edited_tests_and_conftest_do_not_count_but_are_reported(tmp_path:
     g = await run_grade("roman", work)
     assert g.verdict is Verdict.FAIL
     assert g.ignored_changes == ("conftest.py", "pytest.ini", "tests/test_roman.py")
+    assert g.tampered == g.ignored_changes  # config, conftest and an edited test: all tampering
 
 
 @pytest.mark.asyncio
@@ -131,6 +139,7 @@ def test_payload_is_json_shaped() -> None:
         "exit_code": 0,
         "timed_out": False,
         "ignored_changes": ["x.py"],
+        "tampered": [],
         "output": "3 passed",
     }
 
@@ -170,3 +179,37 @@ async def test_grading_in_the_local_sandbox(tmp_path: Path) -> None:
     work = agent_copy("slugify", tmp_path, solved=True)
     g = await grade(load_task("slugify"), work, LocalSandboxRunner)
     assert g.verdict is Verdict.PASS_, g.output
+
+
+def test_added_files_are_split_from_tampering(tmp_path: Path) -> None:
+    pristine = tmp_path / "p"
+    (pristine / "tests").mkdir(parents=True)
+    (pristine / "tests" / "test_a.py").write_text("")
+    changed = [
+        "tests/test_a.py",  # modified pristine file
+        "tests/test_new.py",  # an extra test: honest
+        "notes.md",
+        "scratch_helper.py",
+        "tests/conftest.py",
+        "setup.cfg",
+        "pytest.py",  # shadows test infrastructure
+        "pytest/__main__.py",
+        "json.py",  # shadows the standard library
+    ]
+    tampered, added = split_changes(pristine, changed)
+    assert added == ["tests/test_new.py", "notes.md", "scratch_helper.py"]
+    assert tampered == [
+        "tests/test_a.py",
+        "tests/conftest.py",
+        "setup.cfg",
+        "pytest.py",
+        "pytest/__main__.py",
+        "json.py",
+    ]
+
+
+def test_shadows_a_module() -> None:
+    assert shadows_a_module("os.py")
+    assert shadows_a_module("pkg/pluggy/__init__.py")
+    assert not shadows_a_module("my_helper_xyz.py")
+    assert not shadows_a_module("data/__init__.txt")
