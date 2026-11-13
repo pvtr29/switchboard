@@ -46,6 +46,11 @@ shutdown), its `run_tests` tool in `runner_factory` (the macOS sandbox by defaul
 from the task's repo. Without an explicit token budget such a job gets
 `default_rollout_tokens`.
 
+Retry later: a job the runner paused with a `resume_at` (its agent raised RetryLater, e.g. a
+daily provider quota) gets a timer that resumes it then (`paused -> queued`, reason
+"retry time reached"). Timers are rebuilt at start from each paused job's last state change,
+so they survive restarts; a manual resume or cancel first simply makes the timer a no-op.
+
 Grading: a store listener sees every `* -> verifying` commit of a job that has a task and
 starts a grading task (bounded by `max_running`): `verify.grader.grade` runs the visible and
 hidden tests in a fresh copy, then `verifying -> done` + `verdict_recorded` are appended as one
@@ -474,6 +479,7 @@ class Daemon:
         self.default_rollout_tokens = default_rollout_tokens
         self._llms: dict[tuple[str, ...], LLMClient] = {}
         self._grading: dict[str, asyncio.Task[None]] = {}
+        self._wakeups: dict[str, asyncio.Task[None]] = {}
         self._grade_slots = asyncio.Semaphore(max_running)
         self.debug_asyncio = debug_asyncio
         self.on_token = on_token
@@ -565,6 +571,17 @@ class Daemon:
                 verify=self.verify_projection,
                 clock=self._clock,
             )
+            for job in await self._store.list_jobs(JobState.PAUSED):
+                last = next(
+                    (
+                        e
+                        for e in reversed(await self._store.read_job(job.job_id))
+                        if e.type is EventType.STATE_CHANGED
+                    ),
+                    None,
+                )
+                if last is not None and "resume_at" in last.payload:
+                    self._schedule_wakeup(job.job_id, float(last.payload["resume_at"]))
             for job in await self._store.list_jobs(JobState.VERIFYING):
                 if job.kind is JobKind.ROLLOUT:  # fake jobs are never graded
                     self._schedule_grading(job.job_id)
@@ -745,6 +762,8 @@ class Daemon:
         if self._closing:
             return
         for e in events:
+            if e.type is EventType.STATE_CHANGED and "resume_at" in e.payload:
+                self._schedule_wakeup(e.job_id, float(e.payload["resume_at"]))
             if e.type is EventType.STATE_CHANGED and e.payload.get("to") == "verifying":
                 spec = self._specs.get(e.job_id)
                 if spec is None or spec.task is not None:
@@ -763,7 +782,37 @@ class Daemon:
         if not task.cancelled() and (exc := task.exception()) is not None:
             logger.error("grading of %s crashed", job_id, exc_info=exc)
 
+    def _schedule_wakeup(self, job_id: str, resume_at: float) -> None:
+        old = self._wakeups.pop(job_id, None)
+        if old is not None:
+            old.cancel()
+        task = asyncio.create_task(self._wake(job_id, resume_at), name=f"wake-{job_id}")
+        self._wakeups[job_id] = task
+
+        def done(t: asyncio.Task[None]) -> None:
+            if self._wakeups.get(job_id) is t:
+                del self._wakeups[job_id]
+            if not t.cancelled() and (exc := t.exception()) is not None:
+                logger.error("wake-up of %s crashed", job_id, exc_info=exc)
+
+        task.add_done_callback(done)
+
+    async def _wake(self, job_id: str, resume_at: float) -> None:
+        await asyncio.sleep(max(0.0, resume_at - self._clock()))
+        await self._ensure_spec(job_id)
+        try:
+            await self.supervisor.resume(job_id, reason="retry time reached")
+        except (NotResumable, UnknownJob, SupervisorClosed):
+            pass  # resumed, cancelled or shutting down meanwhile: nothing to do
+        else:
+            logger.info("job %s resumed after its retry wait", job_id)
+
     async def _stop_grading(self) -> None:
+        wakeups = list(self._wakeups.values())
+        for w in wakeups:
+            w.cancel()
+        if wakeups:
+            await asyncio.wait(wakeups)
         tasks = list(self._grading.values())
         for t in tasks:
             t.cancel()

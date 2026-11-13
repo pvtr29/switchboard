@@ -16,6 +16,7 @@ from rollout_fakes import PlainRunner, Script, ScriptedLLM, hack_script, solve_s
 from switchboard.agents.tools import CommandRunner, RunResult
 from switchboard.client.conn import Client, ClientError
 from switchboard.daemon.server import DEFAULT_ROLLOUT_TOKENS, Daemon
+from switchboard.llm.types import QuotaExhausted
 from switchboard.store import EventStore
 from switchboard.tasks import load_task
 
@@ -201,3 +202,42 @@ async def test_a_job_left_verifying_is_graded_at_the_next_start(env: Env) -> Non
     job = await wait_state(d2, job_id, ["done", "failed"])
     assert job.verdict.value == "pass"
     assert len(await events(d2.store, job_id, "verdict_recorded")) == 1
+
+
+async def test_out_of_quota_pauses_then_resumes_by_itself(env: Env) -> None:
+    llm = ScriptedLLM(solve_script(ROMAN.root, "roman.py"))
+    llm.fail_once[1] = QuotaExhausted("daily quota", retry_after_s=0.3)
+    d = await env.start(llm)
+    job_id = await submit(d)
+    job = await wait_state(d, job_id, ["done", "failed"])
+    assert job.verdict.value == "pass"
+    changes = [e.payload for e in await events(d.store, job_id, "state_changed")]
+    paused = next(c for c in changes if c["to"] == "paused")
+    assert paused["reason"].startswith("retry later: daily quota")
+    assert "resume_at" in paused
+    assert any(c["reason"] == "retry time reached" for c in changes)
+    assert llm.calls == [0, 1, 1, 2]  # step 1 re-sampled: nothing of it was committed
+
+
+async def test_the_retry_wait_survives_a_daemon_restart(env: Env) -> None:
+    llm = ScriptedLLM(solve_script(ROMAN.root, "roman.py"))
+    llm.fail_once[0] = QuotaExhausted("daily quota", retry_after_s=1.0)
+    d1 = await env.start(llm)
+    job_id = await submit(d1)
+    await wait_state(d1, job_id, ["paused"])
+    await d1.shutdown()
+    d2 = await env.start(llm)
+    job = await wait_state(d2, job_id, ["done", "failed"])
+    assert job.verdict.value == "pass"
+
+
+async def test_a_manual_resume_before_the_wait_ends_is_fine(env: Env) -> None:
+    llm = ScriptedLLM(solve_script(ROMAN.root, "roman.py"))
+    llm.fail_once[0] = QuotaExhausted("daily quota", retry_after_s=3600.0)
+    d = await env.start(llm)
+    job_id = await submit(d)
+    await wait_state(d, job_id, ["paused"])
+    async with await Client.connect(str(d.socket_path)) as c:
+        await c.request("resume", job_id=job_id)
+    job = await wait_state(d, job_id, ["done", "failed"])
+    assert job.verdict.value == "pass"

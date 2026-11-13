@@ -32,6 +32,7 @@ from switchboard.llm.types import (
     AttemptRecord,
     BadRequest,
     ModelTurn,
+    QuotaExhausted,
     StopKind,
     ToolCall,
     ToolDef,
@@ -437,3 +438,32 @@ async def test_daily_quota_429_skips_to_the_next_model_but_short_429s_retry() ->
     turn2 = await complete(make(sdk2))
     assert turn2.model == "m1"
     assert [a.action for a in turn2.failed_attempts] == ["retry"]
+
+
+def quota_429(wait: str) -> errors.ClientError:
+    return errors.ClientError(
+        429,
+        {
+            "error": {
+                "message": f"Quota exceeded. Please retry in {wait}.",
+                "status": "RESOURCE_EXHAUSTED",
+            }
+        },
+    )
+
+
+async def test_every_model_out_of_daily_quota_raises_quota_exhausted_with_the_soonest_wait() -> (
+    None
+):
+    sdk = FakeSdk(by_model={"m1": [quota_429("5h")], "m2": [quota_429("2h30m")]})
+    with pytest.raises(QuotaExhausted) as ei:
+        await complete(make(sdk))
+    assert ei.value.retry_after_s == 2.5 * 3600
+    assert isinstance(ei.value, Unavailable)  # callers that only know Unavailable still work
+
+
+async def test_quota_on_one_model_and_an_outage_on_the_other_is_plain_unavailable() -> None:
+    sdk = FakeSdk(by_model={"m1": [quota_429("5h")], "m2": [server_error(503)] * 3})
+    with pytest.raises(Unavailable) as ei:
+        await complete(make(sdk))
+    assert not isinstance(ei.value, QuotaExhausted)

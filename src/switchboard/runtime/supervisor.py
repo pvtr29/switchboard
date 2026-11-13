@@ -328,7 +328,7 @@ class Supervisor:
             raise NotPausable(f"job {job_id} is {job.state.value} and cannot be paused")
         self._pause_requested.add(job_id)
 
-    async def resume(self, job_id: str) -> None:
+    async def resume(self, job_id: str, reason: str = "resumed by user") -> None:
         """paused -> queued, then start the job again through normal slot admission."""
         task = self._tasks.get(job_id)
         if task is not None and not task.done() and job_id in self._pause_requested:
@@ -341,7 +341,7 @@ class Supervisor:
             raise NotResumable(f"job {job_id} is {job.state.value}, not paused")
         await self.wait(job_id)  # the paused task may still be releasing its slot
         try:
-            await self._append_state(job, JobState.QUEUED, "resumed by user")
+            await self._append_state(job, JobState.QUEUED, reason)
         except ProjectionError as exc:
             raise NotResumable(f"job {job_id} was resumed concurrently") from exc
         self.start(job_id)

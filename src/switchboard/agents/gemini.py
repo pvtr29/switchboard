@@ -42,13 +42,14 @@ from switchboard.llm.client import (
     tool_result_message,
     user_message,
 )
-from switchboard.llm.types import ModelTurn, Refused, StopKind, Truncated
+from switchboard.llm.types import ModelTurn, QuotaExhausted, Refused, StopKind, Truncated
 from switchboard.llm.types import ToolCall as LLMToolCall
 from switchboard.runtime.agent import (
     ActResult,
     Message,
     ModelResponse,
     Pricing,
+    RetryLater,
     StepContext,
     ToolCall,
     ToolSpec,
@@ -155,15 +156,18 @@ class GeminiAgent:
         if not messages:
             raise AgentError("empty history: job_created.instructions must hold the task")
         rounds = _recovery_rounds(messages)
-        turn = await self.client.complete(
-            messages,
-            TOOL_DEFS,
-            system=self.system_prompt,
-            max_output_tokens=ctx.max_output_tokens
-            if ctx.max_output_tokens is not None
-            else self.max_output_tokens,
-            deadline_s=self.deadline_s,
-        )
+        try:
+            turn = await self.client.complete(
+                messages,
+                TOOL_DEFS,
+                system=self.system_prompt,
+                max_output_tokens=ctx.max_output_tokens
+                if ctx.max_output_tokens is not None
+                else self.max_output_tokens,
+                deadline_s=self.deadline_s,
+            )
+        except QuotaExhausted as exc:
+            raise RetryLater(str(exc), retry_after_s=exc.retry_after_s) from exc
         message: dict[str, Any] = dict(turn.message)
         message["stop"] = turn.stop.value
         calls: tuple[LLMToolCall, ...] = turn.tool_calls

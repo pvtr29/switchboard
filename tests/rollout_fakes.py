@@ -69,6 +69,7 @@ class ScriptedLLM:
         self.calls: list[int] = []
         self.gates: dict[int, asyncio.Event] = {}
         self.entered: dict[int, asyncio.Event] = {}
+        self.fail_once: dict[int, Exception] = {}  # step -> raised on that step's first call
 
     def fingerprint(self) -> Mapping[str, Any]:
         return {"provider": "scripted", "models": list(self.models)}
@@ -93,6 +94,8 @@ class ScriptedLLM:
         if step in self.entered:
             self.entered[step].set()
             await self.gates[step].wait()
+        if step in self.fail_once:
+            raise self.fail_once.pop(step)
         name, args = self.script[step]
         call = ToolCall(f"call-{step}", name, dict(args))
         message = {

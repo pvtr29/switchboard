@@ -90,6 +90,7 @@ from switchboard.runtime.agent import (
     Message,
     ModelResponse,
     ReplayPolicy,
+    RetryLater,
     StepContext,
     ToolCall,
 )
@@ -330,6 +331,25 @@ async def run_job(
         )
         return await _current()
 
+    async def pause_until(reason: str, resume_at: float) -> Job:
+        """The agent said "retry later": pause (nothing of the step is committed) and record
+        when the job may run again; the daemon resumes it then."""
+        await store.append_group(
+            [
+                *active_events(),
+                event(
+                    EventType.STATE_CHANGED,
+                    {
+                        "from": JobState.RUNNING.value,
+                        "to": JobState.PAUSED.value,
+                        "reason": reason,
+                        "resume_at": resume_at,
+                    },
+                ),
+            ]
+        )
+        return await _current()
+
     async def over_budget(reason: str, *, record_active: bool) -> Job:
         await store.append_group(
             [
@@ -526,6 +546,11 @@ async def run_job(
             if sample_error is not None:
                 if budget is not None and reservation is not None:
                     budget.release(reservation)
+                if isinstance(sample_error, RetryLater):
+                    return await pause_until(
+                        f"retry later: {sample_error}"[:500],
+                        clock() + sample_error.retry_after_s,
+                    )
                 return await fail(f"agent error: {type(sample_error).__name__}: {sample_error}")
             if budget is not None and reservation is not None:
                 budget.settle(reservation, response.usage)

@@ -37,6 +37,7 @@ from switchboard.llm.types import (
     AttemptRecord,
     BadRequest,
     ModelTurn,
+    QuotaExhausted,
     StopKind,
     ToolCall,
     ToolDef,
@@ -315,11 +316,15 @@ class GeminiClient:
     ) -> ModelTurn:
         contents = contents_from_history(history)
         config = self._config(tools, system, max_output_tokens, deadline_s)
+        quota_wait: dict[str, float] = {}  # model -> seconds it said to wait (long 429s only)
 
         async def attempt(model: str) -> ModelTurn:
             try:
                 return await self._stream_once(model, contents, config)
             except errors.APIError as exc:
+                wait = _retry_in_s(str(exc.message or "")) if exc.code == 429 else None
+                if wait is not None and wait > LONG_QUOTA_WAIT_S:
+                    quota_wait[model] = wait
                 verdict, reason = classify_error(exc)
                 if verdict is Verdict.RAISE:
                     raise BadRequest(reason) from exc
@@ -338,6 +343,10 @@ class GeminiClient:
             )
         except Unavailable as exc:
             self._cool_down(exc.attempts)
+            if quota_wait and set(quota_wait) >= set(self.models):
+                raise QuotaExhausted(
+                    str(exc), retry_after_s=min(quota_wait.values()), attempts=exc.attempts
+                ) from exc
             raise
         self._cool_down(outcome.failed_attempts)
         return dataclasses.replace(outcome.value, failed_attempts=outcome.failed_attempts)

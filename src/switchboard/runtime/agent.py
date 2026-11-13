@@ -18,6 +18,17 @@ type Message = Mapping[str, Any]
 """A JSON-compatible chat message, e.g. {"role": "assistant", "content": "..."}."""
 
 
+class RetryLater(Exception):
+    """Raised by `Agent.sample` when the call cannot succeed now but will later (e.g. a daily
+    provider quota). The runner pauses the job, recording `resume_at`, instead of failing it;
+    the daemon resumes it then. Nothing of the step is committed, so the resumed job re-samples
+    the same step from the same history."""
+
+    def __init__(self, message: str, *, retry_after_s: float) -> None:
+        super().__init__(message)
+        self.retry_after_s = max(0.0, retry_after_s)
+
+
 class ReplayPolicy(StrEnum):
     """What recovery may do with a tool call of unknown outcome (enforced by the effect journal)."""
 

@@ -33,6 +33,7 @@ from switchboard.llm.gemini import GeminiClient
 from switchboard.llm.retry import RetryPolicy
 from switchboard.llm.types import (
     ModelTurn,
+    QuotaExhausted,
     Refused,
     StopKind,
     ToolCall,
@@ -45,6 +46,7 @@ from switchboard.runtime.agent import (
     ModelResponse,
     Pricing,
     ReplayPolicy,
+    RetryLater,
     StepContext,
 )
 from switchboard.runtime.budget import BudgetManager
@@ -331,6 +333,13 @@ async def test_client_errors_propagate() -> None:
     boom = RuntimeError("boom")
     with pytest.raises(RuntimeError, match="boom"):
         await agent_for(ScriptedClient(boom)).sample(ctx_for(), instructions(TASK))
+
+
+async def test_quota_exhausted_becomes_retry_later() -> None:
+    quota = QuotaExhausted("all models out of quota", retry_after_s=3600.0)
+    with pytest.raises(RetryLater) as ei:
+        await agent_for(ScriptedClient(quota)).sample(ctx_for(), instructions(TASK))
+    assert ei.value.retry_after_s == 3600.0
 
 
 # ---------------------------------------------------------------- act

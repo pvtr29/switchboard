@@ -115,6 +115,17 @@ class Unavailable(LLMError):
     """Every model stayed unavailable through all its retries (503/504/timeouts/...)."""
 
 
+class QuotaExhausted(Unavailable):
+    """Every model is out of quota for a long time (a daily limit), not briefly rate-limited.
+    `retry_after_s` is the soonest any of them said it would accept calls again."""
+
+    def __init__(
+        self, message: str, *, retry_after_s: float, attempts: tuple[AttemptRecord, ...] = ()
+    ) -> None:
+        super().__init__(message, attempts=attempts)
+        self.retry_after_s = retry_after_s
+
+
 class Refused(LLMError):
     """The provider refused to answer (safety block). Retrying the same input will not help."""
 
