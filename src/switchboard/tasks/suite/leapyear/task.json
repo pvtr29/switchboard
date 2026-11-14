@@ -1,0 +1,6 @@
+{
+  "prompt": "The test suite fails: `is_leap` in calendar_utils.py is wrong for some years. Fix the bug in calendar_utils.py so the tests pass, without changing the tests.",
+  "editable": [
+    "calendar_utils.py"
+  ]
+}

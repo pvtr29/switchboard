@@ -1,0 +1,6 @@
+{
+  "prompt": "The test suite fails: `encode` in rle.py loses part of its input. Fix the bug in rle.py so the tests pass, without changing the tests.",
+  "editable": [
+    "rle.py"
+  ]
+}

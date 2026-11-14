@@ -128,6 +128,9 @@ _UNIT_S = {"h": 3600.0, "m": 60.0, "s": 1.0}
 LONG_QUOTA_WAIT_S = 120.0
 """A 429 that says to retry in longer than this (a daily quota) is not worth retrying: the next
 model is tried instead. Shorter waits are ordinary rate limiting and are retried with backoff."""
+DEFAULT_RATE_LIMIT_WAIT_S = 60.0
+"""How long to pause a job whose models all answered 429 without saying when to retry: the free
+tier's per-minute limits reset within a minute."""
 
 
 def _retry_in_s(message: str) -> float | None:
@@ -316,15 +319,20 @@ class GeminiClient:
     ) -> ModelTurn:
         contents = contents_from_history(history)
         config = self._config(tools, system, max_output_tokens, deadline_s)
-        quota_wait: dict[str, float] = {}  # model -> seconds it said to wait (long 429s only)
+        # model -> the wait its LAST failure asked for, if that failure was a 429 (None: a 429
+        # that named no wait). A model whose last failure was anything else is not in here.
+        limited: dict[str, float | None] = {}
 
         async def attempt(model: str) -> ModelTurn:
             try:
                 return await self._stream_once(model, contents, config)
-            except errors.APIError as exc:
-                wait = _retry_in_s(str(exc.message or "")) if exc.code == 429 else None
-                if wait is not None and wait > LONG_QUOTA_WAIT_S:
-                    quota_wait[model] = wait
+            except Exception as exc:
+                if isinstance(exc, errors.APIError) and exc.code == 429:
+                    limited[model] = _retry_in_s(str(exc.message or ""))
+                else:
+                    limited.pop(model, None)
+                if not isinstance(exc, errors.APIError):
+                    raise
                 verdict, reason = classify_error(exc)
                 if verdict is Verdict.RAISE:
                     raise BadRequest(reason) from exc
@@ -343,9 +351,17 @@ class GeminiClient:
             )
         except Unavailable as exc:
             self._cool_down(exc.attempts)
-            if quota_wait and set(quota_wait) >= set(self.models):
+            # Every model is rate-limited or out of quota: not the job's fault, so the agent
+            # pauses it (RetryLater) instead of failing it. Short per-minute limits count too:
+            # retrying them for a few seconds is the backoff's job, but once that is used up the
+            # job must wait, not die (seen live: the free tier's per-minute limit failed a
+            # rollout at step 8 of a kill -9 demo).
+            if limited and set(limited) >= set(self.models):
+                waits = [w for w in limited.values() if w is not None]
                 raise QuotaExhausted(
-                    str(exc), retry_after_s=min(quota_wait.values()), attempts=exc.attempts
+                    str(exc),
+                    retry_after_s=min(waits) if waits else DEFAULT_RATE_LIMIT_WAIT_S,
+                    attempts=exc.attempts,
                 ) from exc
             raise
         self._cool_down(outcome.failed_attempts)

@@ -1,0 +1,6 @@
+{
+  "prompt": "The test suite fails: `transpose` in matrix.py fails on matrices that are not square. Fix the bug in matrix.py so the tests pass, without changing the tests.",
+  "editable": [
+    "matrix.py"
+  ]
+}

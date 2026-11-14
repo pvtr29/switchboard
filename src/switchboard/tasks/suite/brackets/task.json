@@ -1,0 +1,6 @@
+{
+  "prompt": "The test suite fails: `balanced` in brackets.py accepts some strings whose brackets do not match. Fix the bug in brackets.py so the tests pass, without changing the tests.",
+  "editable": [
+    "brackets.py"
+  ]
+}

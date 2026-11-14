@@ -1,0 +1,6 @@
+{
+  "prompt": "The test suite fails: `parse_duration` in duration.py returns wrong numbers of seconds. Fix the bug in duration.py so the tests pass, without changing the tests.",
+  "editable": [
+    "duration.py"
+  ]
+}

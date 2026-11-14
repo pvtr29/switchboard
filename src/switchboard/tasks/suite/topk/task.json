@@ -1,0 +1,6 @@
+{
+  "prompt": "The test suite fails: `top_words` in topk.py returns the wrong words when counts are tied. Fix the bug in topk.py so the tests pass, without changing the tests.",
+  "editable": [
+    "topk.py"
+  ]
+}

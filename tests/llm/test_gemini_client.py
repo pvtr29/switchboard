@@ -26,7 +26,7 @@ from switchboard.llm.client import (
     tool_result_message,
     user_message,
 )
-from switchboard.llm.gemini import GeminiClient, contents_from_history
+from switchboard.llm.gemini import DEFAULT_RATE_LIMIT_WAIT_S, GeminiClient, contents_from_history
 from switchboard.llm.retry import RetryPolicy
 from switchboard.llm.types import (
     AttemptRecord,
@@ -460,6 +460,38 @@ async def test_every_model_out_of_daily_quota_raises_quota_exhausted_with_the_so
         await complete(make(sdk))
     assert ei.value.retry_after_s == 2.5 * 3600
     assert isinstance(ei.value, Unavailable)  # callers that only know Unavailable still work
+
+
+async def test_every_model_rate_limited_per_minute_pauses_instead_of_failing() -> None:
+    """Short 429s are retried first; when the retries run out on every model the job must be
+    paused (QuotaExhausted -> RetryLater), not failed."""
+    sdk = FakeSdk(by_model={"m1": [quota_429("41.5s")] * 3, "m2": [quota_429("12s")] * 3})
+    with pytest.raises(QuotaExhausted) as ei:
+        await complete(make(sdk))
+    assert ei.value.retry_after_s == 12.0
+
+
+async def test_a_429_without_a_stated_wait_pauses_for_the_default() -> None:
+    bare = errors.ClientError(
+        429,
+        {"error": {"message": "You exceeded your current quota.", "status": "RESOURCE_EXHAUSTED"}},
+    )
+    sdk = FakeSdk(by_model={"m1": [bare] * 3, "m2": [bare] * 3})
+    with pytest.raises(QuotaExhausted) as ei:
+        await complete(make(sdk))
+    assert ei.value.retry_after_s == DEFAULT_RATE_LIMIT_WAIT_S
+
+
+async def test_a_model_that_429d_then_failed_otherwise_is_not_rate_limited() -> None:
+    sdk = FakeSdk(
+        by_model={
+            "m1": [quota_429("5s"), server_error(503), server_error(503)],
+            "m2": [quota_429("5h")],
+        }
+    )
+    with pytest.raises(Unavailable) as ei:
+        await complete(make(sdk))
+    assert not isinstance(ei.value, QuotaExhausted)  # m1's last failure was an outage
 
 
 async def test_quota_on_one_model_and_an_outage_on_the_other_is_plain_unavailable() -> None:

@@ -1,0 +1,6 @@
+{
+  "prompt": "The test suite fails: `dedupe` in dedupe.py does not keep the items in their original order. Fix the bug in dedupe.py so the tests pass, without changing the tests.",
+  "editable": [
+    "dedupe.py"
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "prompt": "The test suite fails: `compare` in versions.py orders some version numbers wrongly. Fix the bug in versions.py so the tests pass, without changing the tests.",
+  "editable": [
+    "versions.py"
+  ]
+}

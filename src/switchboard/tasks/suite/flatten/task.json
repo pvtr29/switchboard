@@ -1,0 +1,6 @@
+{
+  "prompt": "The test suite fails: `flatten` in flatten.py does not flatten everything. Fix the bug in flatten.py so the tests pass, without changing the tests.",
+  "editable": [
+    "flatten.py"
+  ]
+}

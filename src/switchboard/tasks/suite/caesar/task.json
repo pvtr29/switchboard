@@ -1,0 +1,6 @@
+{
+  "prompt": "The test suite fails: `shift` in caesar.py garbles some characters. Fix the bug in caesar.py so the tests pass, without changing the tests.",
+  "editable": [
+    "caesar.py"
+  ]
+}

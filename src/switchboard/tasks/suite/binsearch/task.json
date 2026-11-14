@@ -1,0 +1,6 @@
+{
+  "prompt": "The test suite fails: `find` in binsearch.py does not find some values that are in the list. Fix the bug in binsearch.py so the tests pass, without changing the tests.",
+  "editable": [
+    "binsearch.py"
+  ]
+}

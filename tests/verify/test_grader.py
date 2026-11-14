@@ -53,6 +53,16 @@ def test_the_suite_has_tasks_with_prompts_and_hidden_tests() -> None:
             assert (t.solution / rel).is_file()
 
 
+def test_every_task_ships_a_pytest_ini_the_agent_may_not_edit() -> None:
+    """Without one, pytest searches parent directories for config: under a directory with a
+    pyproject.toml it crashed in the sandbox (seen in a live rollout) or would pick up foreign
+    settings."""
+    for name in TASKS:
+        t = load_task(name)
+        assert (t.repo / "pytest.ini").is_file(), name
+        assert "pytest.ini" not in t.editable
+
+
 def test_unknown_and_unsafe_task_names_are_rejected() -> None:
     for bad in ("nope", "../tasks", ".hidden", "roman/repo"):
         with pytest.raises(UnknownTask):

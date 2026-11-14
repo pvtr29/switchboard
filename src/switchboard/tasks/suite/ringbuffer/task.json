@@ -1,0 +1,6 @@
+{
+  "prompt": "The test suite fails: `RingBuffer` in ringbuffer.py returns items in the wrong order once it is full. Fix the bug in ringbuffer.py so the tests pass, without changing the tests.",
+  "editable": [
+    "ringbuffer.py"
+  ]
+}

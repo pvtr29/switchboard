@@ -1,0 +1,6 @@
+{
+  "prompt": "The test suite fails: `count_words` in wordcount.py counts the same word as different words. Fix the bug in wordcount.py so the tests pass, without changing the tests.",
+  "editable": [
+    "wordcount.py"
+  ]
+}

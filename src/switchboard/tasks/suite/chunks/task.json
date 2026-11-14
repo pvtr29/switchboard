@@ -1,0 +1,6 @@
+{
+  "prompt": "The test suite fails: `chunks` in chunking.py drops some items. Fix the bug in chunking.py so the tests pass, without changing the tests.",
+  "editable": [
+    "chunking.py"
+  ]
+}

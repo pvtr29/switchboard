@@ -1,0 +1,6 @@
+{
+  "prompt": "The test suite fails: `median` in stats_utils.py returns wrong values for some inputs. Fix the bug in stats_utils.py so the tests pass, without changing the tests.",
+  "editable": [
+    "stats_utils.py"
+  ]
+}

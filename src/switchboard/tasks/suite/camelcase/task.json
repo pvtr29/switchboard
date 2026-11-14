@@ -1,0 +1,6 @@
+{
+  "prompt": "The test suite fails: `snake_to_camel` in naming.py produces wrong names. Fix the bug in naming.py so the tests pass, without changing the tests.",
+  "editable": [
+    "naming.py"
+  ]
+}
