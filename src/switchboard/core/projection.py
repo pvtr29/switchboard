@@ -12,6 +12,16 @@ original IllegalTransition is chained as `__cause__`), so callers need to catch 
 in any non-terminal state.
 Unknown extra payload keys are ignored (payloads may grow within a version).
 
+Epoch fencing: every event after `job_created` must carry the job's current epoch, except the
+two ownership events, which must carry exactly current + 1 and so move the epoch forward:
+`lease_acquired` (a runner claims the job; sets the owner) and `lease_lost` (someone else takes
+the job away from its owner: recovery re-queueing it, a cancel; clears the owner). Anything else
+raises StaleEpoch. Because the check runs in the fold, inside the transaction that inserts the
+events, a writer still holding an old epoch can neither commit a step, log a response, record
+an effect intent nor claim the job a second time: its group is rolled back and it gets the
+exception. Two runners that claim from the same epoch race for the same current + 1 and exactly
+one wins. A log written before fencing existed has every event at epoch 0 and folds unchanged.
+
 JSON conventions for Budget/Usage: `budget_to_dict` omits unlimited (None) dimensions, and
 `budget_from_dict` treats a missing key (or an explicit null) as unlimited. Usage always
 writes all three keys.
@@ -26,6 +36,14 @@ from switchboard.core.states import TERMINAL_STATES, IllegalTransition, JobState
 
 class ProjectionError(ValueError):
     """An event cannot be folded into the job projection (bad payload or invalid sequence)."""
+
+
+class StaleEpoch(ProjectionError):
+    """The event's epoch is not the one the job's current owner writes with (see module
+    docstring): its writer no longer owns the job."""
+
+
+_OWNERSHIP_EVENTS = frozenset({EventType.LEASE_ACQUIRED, EventType.LEASE_LOST})
 
 
 # ---- JSON helpers ------------------------------------------------------------------------
@@ -131,6 +149,12 @@ def apply(job: Job | None, event: Event) -> Job:
         raise ProjectionError(f"{_where(event)}: job does not exist (no job_created)")
     if job.job_id != event.job_id:
         raise ProjectionError(f"{_where(event)}: event applied to job {job.job_id}")
+    expected = job.epoch + 1 if event.type in _OWNERSHIP_EVENTS else job.epoch
+    if event.epoch != expected:
+        raise StaleEpoch(
+            f"{_where(event)}: written with epoch {event.epoch}, job is at epoch {job.epoch}"
+            f" (expected {expected})"
+        )
 
     changes: dict[str, Any] = {}
     match event.type:
@@ -189,14 +213,19 @@ def apply(job: Job | None, event: Event) -> Job:
                 usd_micros=_int_default(event, "usd_micros"),
             )
         case EventType.LEASE_ACQUIRED:
+            # lease_until is optional: a single daemon owns its jobs until it dies or another
+            # owner fences it off; time-limited leases with heartbeats come with many workers.
             lease_until = event.payload.get("lease_until")
-            if not isinstance(lease_until, int | float) or isinstance(lease_until, bool):
+            if lease_until is not None and not _is_num(lease_until):
                 raise ProjectionError(f"{_where(event)}: payload.lease_until must be a number")
             changes.update(
-                owner=_str(event, "worker"), lease_until=float(lease_until), epoch=event.epoch
+                owner=_str(event, "worker"),
+                lease_until=None if lease_until is None else float(lease_until),
+                epoch=event.epoch,
             )
         case EventType.LEASE_LOST:
-            changes.update(owner=None, lease_until=None)
+            _str(event, "reason")
+            changes.update(owner=None, lease_until=None, epoch=event.epoch)
         case _:
             pass  # budget_*, effect_*: journal-only for the projection
     return _replaced(job, event.seq, event.ts, changes)

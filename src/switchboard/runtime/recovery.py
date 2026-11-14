@@ -11,6 +11,8 @@ anything: `kill -9` leaves the log at some commit boundary, and the log alone is
    else a seeded sample of `VERIFY_SAMPLE_SIZE`; `True` forces all jobs, `False` skips it.
 2. Every job in `provisioning` or `running` is moved to `queued` (reason "recovery: daemon
    restart"). Nothing of such a job is alive in this process, so the previous owner is gone.
+   The move is behind a `lease_lost` that advances the epoch (`supervisor.revoke`), so if the
+   previous owner is NOT dead after all (a frozen daemon that wakes up), its writes are refused.
    `provisioning -> queued` is a legal edge for exactly this case (a crash during provisioning
    must be re-queueable); the runner provisions again, which is idempotent.
 3. `queued` jobs (including the ones just re-queued) are admitted through the supervisor in
@@ -40,8 +42,8 @@ from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
-from switchboard.core import Event, EventType, Job, JobState, ProjectionError, fold
-from switchboard.runtime.supervisor import AlreadyRunning, Supervisor
+from switchboard.core import Event, Job, JobState, ProjectionError, fold
+from switchboard.runtime.supervisor import AlreadyRunning, Supervisor, revoke
 from switchboard.store import EventStore
 
 logger = logging.getLogger("switchboard.recovery")
@@ -116,21 +118,7 @@ async def recover(
             continue
         if job.state in (JobState.PROVISIONING, JobState.RUNNING):
             try:
-                await store.append_group(
-                    [
-                        Event(
-                            job_id=job.job_id,
-                            epoch=job.epoch,
-                            ts=clock(),
-                            type=EventType.STATE_CHANGED,
-                            payload={
-                                "from": job.state.value,
-                                "to": JobState.QUEUED.value,
-                                "reason": REASON_RESTART,
-                            },
-                        )
-                    ]
-                )
+                await store.append_group(revoke(job, JobState.QUEUED, REASON_RESTART, clock()))
             except ProjectionError as exc:  # someone moved the job meanwhile: leave it
                 errors.append(f"{job.job_id}: could not re-queue: {exc}")
                 continue

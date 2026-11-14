@@ -256,11 +256,18 @@ class SQLiteEventLog:
     `list_jobs`) always go to the table and never to the cache. Code or tests that modify the
     jobs table behind the log's back must call `rebuild()` (which clears the cache) or use a
     fresh log. Any exception inside `append_groups` clears the cache entirely.
+
+    Another process writing the same database (a second daemon, or a stale one that resumed
+    after being frozen) breaks that invariant, and a stale cache would fold its events against
+    an old epoch, defeating fencing. So each batch, under the write lock, compares the log's
+    head (MAX(seq), an O(log n) rowid lookup) with the head this object last committed, and
+    drops the cache if someone else appended in between.
     """
 
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
         self._cache: dict[str, Job] = {}
+        self._head: int | None = None  # MAX(seq) after this object's last commit
         self.last_changed: dict[str, Job] = {}
         """Projections written by the most recent `append_encoded` (empty after a failure). The
         async store mirrors them in memory; read it on the thread that made the call."""
@@ -309,6 +316,8 @@ class SQLiteEventLog:
         pending: dict[str, Job] = {}  # committed-by-savepoint, not yet by the transaction
         conn.execute("BEGIN IMMEDIATE")
         try:
+            if self._cache and self._max_seq() != self._head:
+                self._cache.clear()  # another writer appended since our last commit
             for group, rows in zip(groups, encoded, strict=True):
                 if not rows:
                     outcomes.append([])
@@ -348,15 +357,22 @@ class SQLiteEventLog:
                         pending[jid] = job
                 outcomes.append(results)
             conn.executemany(_UPSERT_JOB, [_job_to_row(j) for j in pending.values()])
+            head = self._max_seq()
             conn.execute("COMMIT")
         except BaseException:
             self._cache.clear()
+            self._head = None
             if conn.in_transaction:
                 conn.execute("ROLLBACK")
             raise
         self._cache.update(pending)
+        self._head = head
         self.last_changed = pending
         return outcomes
+
+    def _max_seq(self) -> int | None:
+        row = self._conn.execute("SELECT MAX(seq) FROM events").fetchone()
+        return None if row[0] is None else int(row[0])
 
     def _lookup(self, pending: dict[str, Job], job_id: str) -> Job | None:
         job = pending.get(job_id) or self._cache.get(job_id)
@@ -409,6 +425,7 @@ class SQLiteEventLog:
         """
         conn = self._conn
         self._cache.clear()  # repopulated lazily from the new table
+        self._head = None
         conn.execute("BEGIN IMMEDIATE")
         try:
             conn.execute("DELETE FROM effects")  # rebuilt below from the effect events

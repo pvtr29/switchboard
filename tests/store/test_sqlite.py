@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from switchboard.core import Event, EventType
+from switchboard.core import Event, EventType, StaleEpoch
 from switchboard.store import (
     PAYLOAD_VERSIONS,
     SCHEMA_VERSION,
@@ -103,7 +103,7 @@ def test_roundtrip_all_fields(jlog: SQLiteEventLog) -> None:
     payload = {"a": [1, {"b": None, "c": "é"}], "f": 0.5, "t": True}
     src = Event(
         job_id="j1",
-        epoch=3,
+        epoch=0,
         step_id=7,
         ts=123.25,
         type=EventType.STEP_COMPLETED,
@@ -117,7 +117,7 @@ def test_roundtrip_all_fields(jlog: SQLiteEventLog) -> None:
     assert got.seq == 5
     assert (got.job_id, got.epoch, got.step_id, got.ts, got.type, got.v) == (
         "j1",
-        3,
+        0,
         7,
         123.25,
         EventType.STEP_COMPLETED,
@@ -318,3 +318,21 @@ def test_step_uniqueness_rules(jlog: SQLiteEventLog) -> None:
         False,
         True,
     ]
+
+
+def test_a_second_writer_on_the_same_database_invalidates_the_job_cache(tmp_path: Path) -> None:
+    """Fencing must hold across processes: a log whose cached projection is stale (another
+    writer advanced the epoch) must fold against the table, not its cache."""
+
+    def at(epoch: int, type_: EventType, **payload: object) -> Event:
+        return Event(job_id="j1", epoch=epoch, ts=1.0, type=type_, payload=payload)
+
+    with closing(open_db(tmp_path / "x.db")) as c1, closing(open_db(tmp_path / "x.db")) as c2:
+        old, new = SQLiteEventLog(c1), SQLiteEventLog(c2)
+        old.append_many([*created("j1"), at(1, EventType.LEASE_ACQUIRED, worker="old")])
+        old.append_many([at(1, EventType.USAGE_RECORDED)])  # j1 is in old's cache at epoch 1
+        new.append_many([at(2, EventType.LEASE_LOST, reason="takeover")])
+        with pytest.raises(StaleEpoch):
+            old.append_many([at(1, EventType.USAGE_RECORDED)])
+        assert old.append_many([at(2, EventType.USAGE_RECORDED)])[0].status is AppendStatus.INSERTED
+        assert [e.epoch for e in new.read_job("j1")] == [0, 1, 1, 2, 2]

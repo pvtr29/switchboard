@@ -14,6 +14,7 @@ from switchboard.core.models import (
 )
 from switchboard.core.projection import (
     ProjectionError,
+    StaleEpoch,
     apply,
     budget_from_dict,
     budget_to_dict,
@@ -44,6 +45,7 @@ __all__ = [
     "JobState",
     "ProjectionError",
     "Remaining",
+    "StaleEpoch",
     "Usage",
     "Verdict",
     "apply",

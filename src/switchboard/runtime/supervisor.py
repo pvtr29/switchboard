@@ -21,6 +21,8 @@ Outcome recording (`_on_done`, synchronous):
 - It raised anything else (including a BaseException that is not CancelledError): the job is
   moved to failed with reason "supervisor: <type>: <msg>" by a tracked follow-up task, but only
   if its projected state still allows it (provisioning or running); otherwise it is only logged.
+- It raised StaleEpoch: another owner took the job over (fencing). Nothing is recorded: the
+  job is not ours to fail. It is logged and kept as the task's outcome.
 - Cancelled: nothing appended here; `cancel()` appends `-> cancelled` after the task is gone.
   `aclose` (shutdown) cancels tasks WITHOUT recording anything: those jobs stay resumable.
 
@@ -30,7 +32,9 @@ Admission is FIFO. `pause` makes `run_job` return at a step boundary, which ends
 frees the slot; `resume` queues a new task that waits for a slot like any other.
 
 Cancel: `cancel()` cancels the task, waits for it to finish, then appends `<state> ->
-cancelled` with the reason. The task itself writes nothing on cancel. A queued job (waiting for
+cancelled` with the reason, behind a `lease_lost` that moves the epoch on (`revoke`), so an
+owner this process does not know about (a stale daemon on the same database) cannot write to
+the job afterwards. The task itself writes nothing on cancel. A queued job (waiting for
 a slot) is cancelled the same way. Cancelling a cancelled job is a no-op; done/failed raise.
 
 Pause: cooperative. `pause()` sets a flag that `run_job` polls at the step boundary (before
@@ -71,6 +75,7 @@ from switchboard.core import (
     Job,
     JobState,
     ProjectionError,
+    StaleEpoch,
 )
 from switchboard.env.base import Environment
 from switchboard.runtime.agent import Agent
@@ -82,7 +87,7 @@ from switchboard.runtime.budget import (
     TokenBucket,
 )
 from switchboard.runtime.effects import ExternalSink
-from switchboard.runtime.runner import JobNotRunnable, run_job
+from switchboard.runtime.runner import JobNotRunnable, default_worker_id, run_job
 from switchboard.runtime.slots import SlotPool
 from switchboard.store import EventStore, StoreClosed
 
@@ -117,6 +122,28 @@ class NotResumable(RuntimeError):
     """`resume` was called for a job that is not paused."""
 
 
+def revoke(job: Job, to: JobState, reason: str, ts: float) -> list[Event]:
+    """Take `job` away from whoever owns it and move it to `to`, as one group: `lease_lost` at
+    epoch + 1 fences the owner off, then the state change is written at the new epoch."""
+    epoch = job.epoch + 1
+    return [
+        Event(
+            job_id=job.job_id,
+            epoch=epoch,
+            ts=ts,
+            type=EventType.LEASE_LOST,
+            payload={"reason": reason, "worker": job.owner},
+        ),
+        Event(
+            job_id=job.job_id,
+            epoch=epoch,
+            ts=ts,
+            type=EventType.STATE_CHANGED,
+            payload={"from": job.state.value, "to": to.value, "reason": reason},
+        ),
+    ]
+
+
 @dataclass(frozen=True, slots=True)
 class Outcome:
     """How a job's task ended: exactly one of job, error, cancelled is set."""
@@ -130,7 +157,8 @@ class Outcome:
 class SupervisorStats:
     started: int
     finished: int  # run_job returned
-    crashed: int  # run_job raised (not cancelled)
+    crashed: int  # run_job raised (not cancelled), including fenced
+    fenced: int  # run_job raised StaleEpoch: another owner took the job
     cancelled: int
     running: int  # slots held right now (provisioning or running jobs)
     waiting: int  # job tasks waiting for a slot
@@ -151,7 +179,9 @@ class Supervisor:
         rate_limiter: TokenBucket | None = None,
         grace_s: float = DEFAULT_GRACE_S,
         min_output_tokens: int = DEFAULT_MIN_OUTPUT_TOKENS,
+        worker_id: str | None = None,
     ) -> None:
+        self.worker_id = worker_id or default_worker_id()
         self._global_budget = global_budget
         self._rate_limiter = rate_limiter
         self._grace_s = grace_s
@@ -174,6 +204,7 @@ class Supervisor:
         self._started = 0
         self._finished = 0
         self._crashed = 0
+        self._fenced = 0
         self._cancelled = 0
         self.errors: list[tuple[str, BaseException]] = []
         """Infrastructure errors (job_id, exception) that were deliberately not written to the
@@ -189,6 +220,7 @@ class Supervisor:
             self._started,
             self._finished,
             self._crashed,
+            self._fenced,
             self._cancelled,
             self._pool.held,
             self._pool.waiting,
@@ -301,7 +333,9 @@ class Supervisor:
                 self._require_cancelled(job)  # fine only if it ended cancelled
                 return
             try:
-                await self._append_state(job, JobState.CANCELLED, reason)
+                await self._store.append_group(
+                    revoke(job, JobState.CANCELLED, reason, self._clock())
+                )
                 return
             except ProjectionError:
                 continue
@@ -417,6 +451,7 @@ class Supervisor:
                 rate_limiter=self._rate_limiter,
                 grace_s=self._grace_s,
                 watch=watch,
+                worker=self.worker_id,
             )
         finally:
             if self._watches.get(job_id) is watch:
@@ -448,6 +483,15 @@ class Supervisor:
             return
         self._crashed += 1
         self._outcomes[job_id] = Outcome(error=exc)
+        if isinstance(exc, StaleEpoch):
+            self._fenced += 1
+            logger.warning(
+                "job taken over by another owner job_id=%s outcome=fenced error=%s",
+                job_id,
+                exc,
+                extra={"job_id": job_id},
+            )
+            return
         if isinstance(exc, StoreClosed):
             self.errors.append((job_id, exc))
             logger.error(
@@ -517,4 +561,5 @@ __all__ = [
     "SupervisorClosed",
     "SupervisorStats",
     "UnknownJob",
+    "revoke",
 ]

@@ -201,7 +201,8 @@ async def test_config_change_fails_job_and_appends_nothing_else(store: EventStor
     job = await run_job(store, "j1", FakeAgent(system_prompt="changed"))
     assert job.state is JobState.FAILED
     after = await store.read_job("j1")
-    assert len(after) == len(before) + 1
+    assert len(after) == len(before) + 2  # the claim, then the failure
+    assert after[-2].type is T.LEASE_ACQUIRED
     assert after[-1].payload["reason"] == "config changed"
     assert after[-1].type is T.STATE_CHANGED
 
@@ -248,10 +249,12 @@ async def test_non_runnable_states_raise(store: EventStore, state: str) -> None:
     await create_job(store)
     await run_job(store, "j1", FakeAgent(steps=1))  # -> verifying
     if state != "verifying":
+        current = await store.get_job("j1")
+        assert current is not None
         await store.append(
             Event(
                 job_id="j1",
-                epoch=0,
+                epoch=current.epoch,
                 ts=1.0,
                 type=T.STATE_CHANGED,
                 payload={"from": "verifying", "to": state, "reason": "x"},
@@ -287,11 +290,14 @@ async def test_duplicate_llm_responded_uses_logged_response(store: EventStore) -
                     job_id=ctx.job_id, step=0, attempt=9, rng=random.Random("z")
                 )
                 zr = await other.sample(zombie_ctx, history)
+                current = await store.get_job("j1")
+                assert current is not None
+                # Same epoch: fencing does not apply, the unique index on (step, type) does.
                 await store.append_group(
                     [
                         Event(
                             job_id="j1",
-                            epoch=0,
+                            epoch=current.epoch,
                             step_id=0,
                             ts=1.0,
                             type=T.LLM_RESPONDED,

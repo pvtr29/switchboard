@@ -12,6 +12,7 @@ from switchboard.core import (
     JobKind,
     JobState,
     ProjectionError,
+    StaleEpoch,
     Usage,
     Verdict,
     apply,
@@ -44,8 +45,8 @@ def ev(
 CREATED = {"kind": "fake", "task_ref": "task-1", "budget": {"tokens": 100}, "seed": 7}
 
 
-def created(**over: Any) -> Job:
-    return apply(None, ev(T.JOB_CREATED, {**CREATED, **over}, seq=1, ts=5.0, epoch=2))
+def created(epoch: int = 0, **over: Any) -> Job:
+    return apply(None, ev(T.JOB_CREATED, {**CREATED, **over}, seq=1, ts=5.0, epoch=epoch))
 
 
 def moved(job: Job, to: JobState, seq: int = 2, ts: float = 6.0) -> Job:
@@ -54,7 +55,7 @@ def moved(job: Job, to: JobState, seq: int = 2, ts: float = 6.0) -> Job:
 
 
 def test_job_created() -> None:
-    job = created()
+    job = created(epoch=2)
     assert job == Job(
         job_id="j",
         kind=JobKind.FAKE,
@@ -246,18 +247,52 @@ def test_step_completed() -> None:
 def test_lease_events() -> None:
     job = apply(
         created(),
-        ev(T.LEASE_ACQUIRED, {"worker": "w1", "lease_until": 99.5}, seq=2, epoch=3),
+        ev(T.LEASE_ACQUIRED, {"worker": "w1", "lease_until": 99.5}, seq=2, epoch=1),
     )
-    assert (job.owner, job.lease_until, job.epoch) == ("w1", 99.5, 3)
-    job = apply(job, ev(T.LEASE_LOST, {"worker": "w1"}, seq=3, epoch=3))
-    assert (job.owner, job.lease_until, job.epoch) == (None, None, 3)
+    assert (job.owner, job.lease_until, job.epoch) == ("w1", 99.5, 1)
+    job = apply(job, ev(T.LEASE_LOST, {"reason": "recovery"}, seq=3, epoch=2))
+    assert (job.owner, job.lease_until, job.epoch) == (None, None, 2)
+    job = apply(job, ev(T.LEASE_ACQUIRED, {"worker": "w2"}, seq=4, epoch=3))
+    assert (job.owner, job.lease_until, job.epoch) == ("w2", None, 3)  # no expiry
+
+
+def test_events_must_carry_the_current_epoch() -> None:
+    job = apply(created(), ev(T.LEASE_ACQUIRED, {"worker": "w1"}, seq=2, epoch=1))
+    step = {"delta": [], "done": False}
+    ok = apply(job, ev(T.STEP_COMPLETED, step, seq=3, epoch=1, step=0))
+    assert ok.last_step == 0
+    for epoch in (0, 2):  # the stale owner, and a writer from the future
+        with pytest.raises(StaleEpoch, match="expected 1"):
+            apply(job, ev(T.STEP_COMPLETED, step, seq=3, epoch=epoch, step=0))
+
+
+@pytest.mark.parametrize("type_", [T.LEASE_ACQUIRED, T.LEASE_LOST])
+@pytest.mark.parametrize("epoch", [0, 1, 3])
+def test_ownership_events_must_advance_the_epoch_by_exactly_one(
+    type_: EventType, epoch: int
+) -> None:
+    job = apply(created(), ev(T.LEASE_ACQUIRED, {"worker": "w1"}, seq=2, epoch=1))
+    payload = {"worker": "w2", "reason": "takeover"}
+    with pytest.raises(StaleEpoch, match="expected 2"):
+        apply(job, ev(type_, payload, seq=3, epoch=epoch))
+    assert apply(job, ev(type_, payload, seq=3, epoch=2)).epoch == 2
+
+
+def test_two_claims_from_the_same_epoch_exactly_one_wins() -> None:
+    job = created()
+    first = apply(job, ev(T.LEASE_ACQUIRED, {"worker": "a"}, seq=2, epoch=1))
+    with pytest.raises(StaleEpoch):
+        apply(first, ev(T.LEASE_ACQUIRED, {"worker": "b"}, seq=3, epoch=1))
+
+
+def test_stale_epoch_is_a_projection_error() -> None:
+    assert issubclass(StaleEpoch, ProjectionError)  # one except clause still catches both
 
 
 @pytest.mark.parametrize(
     "payload",
     [
         {"lease_until": 1.0},
-        {"worker": "w"},
         {"worker": 1, "lease_until": 1.0},
         {"worker": "w", "lease_until": "x"},
         {"worker": "w", "lease_until": True},
@@ -265,7 +300,7 @@ def test_lease_events() -> None:
 )
 def test_lease_acquired_bad_payload(payload: dict[str, Any]) -> None:
     with pytest.raises(ProjectionError):
-        apply(created(), ev(T.LEASE_ACQUIRED, payload, seq=2))
+        apply(created(), ev(T.LEASE_ACQUIRED, payload, seq=2, epoch=1))
 
 
 @pytest.mark.parametrize(
@@ -293,27 +328,30 @@ def test_full_lifecycle() -> None:
             seq=3,
             ts=3.0,
         ),
-        ev(T.LEASE_ACQUIRED, {"worker": "w", "lease_until": 50.0}, seq=4, ts=3.5),
+        ev(T.LEASE_ACQUIRED, {"worker": "w", "lease_until": 50.0}, seq=4, ts=3.5, epoch=1),
         ev(
             T.USAGE_RECORDED,
             {"tokens_in": 4, "tokens_out": 6, "active_seconds": 1.0},
             seq=5,
             ts=4.0,
+            epoch=1,
         ),
-        ev(T.STEP_COMPLETED, seq=6, ts=4.5, step=0),
+        ev(T.STEP_COMPLETED, seq=6, ts=4.5, epoch=1, step=0),
         ev(
             T.STATE_CHANGED,
             {"from": "running", "to": "verifying", "reason": "finished"},
             seq=7,
             ts=5.0,
+            epoch=1,
         ),
         ev(
             T.STATE_CHANGED,
             {"from": "verifying", "to": "done", "reason": "verified"},
             seq=8,
             ts=6.0,
+            epoch=1,
         ),
-        ev(T.VERDICT_RECORDED, {"verdict": "pass"}, seq=9, ts=6.0),
+        ev(T.VERDICT_RECORDED, {"verdict": "pass"}, seq=9, ts=6.0, epoch=1),
         ev(T.JOB_CREATED, CREATED, seq=10, ts=7.0, job="other"),
     ]
     jobs = fold(log)
@@ -321,7 +359,7 @@ def test_full_lifecycle() -> None:
     j = jobs["j"]
     assert (j.state, j.verdict) == (S.DONE, Verdict.PASS_)
     assert j.usage == Usage(active_seconds=1.0, tokens=10)
-    assert (j.last_step, j.owner, j.last_seq) == (0, "w", 9)
+    assert (j.last_step, j.owner, j.last_seq, j.epoch) == (0, "w", 9, 1)
     assert (j.created_at, j.updated_at) == (1.0, 6.0)
     assert jobs["other"].state is S.QUEUED
     assert fold([]) == {}

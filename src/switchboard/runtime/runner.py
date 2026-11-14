@@ -29,6 +29,14 @@ On resume (job already running) the runner ALWAYS restores S(n) first, because a
 act phase may have left uncommitted changes, and logs a `restored` event.
 A missing snapshot fails the job with reason "snapshot missing".
 
+Ownership (epoch fencing, see core/projection.py): before writing anything else the runner
+claims the job with `lease_acquired` at epoch + 1 and writes every later event with that epoch.
+If someone takes the job over (another runner claims it, recovery re-queues it, a cancel), the
+next write is rejected and `StaleEpoch` propagates out of `run_job`: the runner stops without
+committing anything more, recording any effect intent, or failing the job on the new owner's
+behalf. The loop also checks the epoch at every step boundary, so a runner that only reads
+learns it lost the job without trying a write first.
+
 Failure policy: an `Exception` from the agent fails the job (state_changed running -> failed,
 reason "agent error: ...") and `run_job` RETURNS the failed job instead of raising, so a
 supervisor needs no exception handling to learn the outcome. CancelledError and other
@@ -68,18 +76,22 @@ still records its usage_recorded: wasted sampling is counted, not hidden.
 
 import asyncio
 import dataclasses
+import os
 import random
+import socket
 import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from switchboard.core import (
+    TERMINAL_STATES,
     Event,
     EventType,
     Job,
     JobState,
     ProjectionError,
+    StaleEpoch,
     usage_from_dict,
     usage_to_dict,
 )
@@ -114,6 +126,11 @@ PREEMPTED = "active_seconds (preempted)"
 
 class JobNotRunnable(RuntimeError):
     """The job does not exist or is in a state `run_job` does not handle."""
+
+
+def default_worker_id() -> str:
+    """Who owns a claimed job: host and process, so a log shows which daemon ran each step."""
+    return f"{socket.gethostname()}:{os.getpid()}"
 
 
 class _LogView:
@@ -259,6 +276,7 @@ async def run_job(
     rate_limiter: TokenBucket | None = None,
     grace_s: float = DEFAULT_GRACE_S,
     watch: DeadlineWatch | None = None,
+    worker: str | None = None,
 ) -> Job:
     """Run `job_id` until it is verifying, failed, or no longer ours; return its projection.
 
@@ -286,12 +304,20 @@ async def run_job(
     output cap in `ctx.max_output_tokens`), `rate_limiter` is awaited before each sample,
     `grace_s` is the hard-preemption grace, `watch` lets the supervisor move a running step's
     deadline after an extension. Active time is always enforced.
+
+    `worker` names the owner in `lease_acquired` (default: `default_worker_id()`). Raises
+    StaleEpoch once another owner has taken the job over (see module docstring).
     """
     job = await store.get_job(job_id)
     if job is None:
         raise JobNotRunnable(f"unknown job {job_id}")
+    if not (
+        job.state in (JobState.QUEUED, JobState.RUNNING)
+        or (job.state is JobState.PROVISIONING and env is not None)
+    ):
+        raise JobNotRunnable(f"job {job_id} is {job.state.value}, expected queued or running")
     log = _LogView(await store.read_job(job_id))
-    epoch = job.epoch
+    epoch = job.epoch + 1  # ours once the claim below commits
 
     def event(type_: EventType, payload: Mapping[str, Any], step: int | None = None) -> Event:
         return Event(
@@ -377,6 +403,12 @@ async def run_job(
         assert current is not None
         return current
 
+    # The claim. Losing the race to another claimant raises StaleEpoch before anything else.
+    await store.append_group(
+        [event(EventType.LEASE_ACQUIRED, {"worker": worker or default_worker_id()})]
+    )
+    job = await _current()
+
     resumed = job.state is JobState.RUNNING
     if job.state is JobState.QUEUED and log.ran:
         await store.append_group(
@@ -410,8 +442,6 @@ async def run_job(
             ]
         )
         job = await _current()
-    elif job.state is not JobState.RUNNING:
-        raise JobNotRunnable(f"job {job_id} is {job.state.value}, expected queued or running")
 
     # Config check happens after the queued -> running move, so a mismatch can fail the job
     # through a legal edge; a pure resume appends nothing but the failure.
@@ -426,6 +456,10 @@ async def run_job(
         # Set synchronously after the read: an extension landing later calls limit_changed.
         watch.limit = job.budget.active_seconds
         mark = None  # nothing of this step is unrecorded yet
+        if job.state in TERMINAL_STATES:
+            return job  # finished, failed or cancelled by someone else
+        if job.epoch != epoch:
+            raise StaleEpoch(f"job {job_id} is at epoch {job.epoch}; this runner owns {epoch}")
         if job.state is not JobState.RUNNING:
             return job  # finished, failed or cancelled by someone else
         if should_stop is not None and should_stop():
@@ -546,6 +580,8 @@ async def run_job(
             if sample_error is not None:
                 if budget is not None and reservation is not None:
                     budget.release(reservation)
+                if isinstance(sample_error, StaleEpoch):
+                    raise sample_error
                 if isinstance(sample_error, RetryLater):
                     return await pause_until(
                         f"retry later: {sample_error}"[:500],
@@ -614,6 +650,8 @@ async def run_job(
             raise
         finally:
             watch.disarm()
+        if isinstance(act_error, StaleEpoch):
+            raise act_error  # an effect intent was refused: the job is not ours any more
         if act_error is not None:
             return await fail(f"agent error: {type(act_error).__name__}: {act_error}")
 
@@ -638,6 +676,8 @@ async def run_job(
             group.append(state_change(JobState.RUNNING, JobState.VERIFYING, "agent finished"))
         try:
             committed = await append_tracked(group)
+        except StaleEpoch:
+            raise  # not ours any more: the new owner re-runs this step
         except ProjectionError:
             # The state move was refused: someone else already moved the job (and the group
             # rolled back). Re-read and let the log decide.

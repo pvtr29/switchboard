@@ -1,6 +1,7 @@
 """The jobs projection inside the store: same-transaction updates, isolation, rebuild."""
 
 import asyncio
+import dataclasses
 import random
 import sqlite3
 import tempfile
@@ -318,11 +319,10 @@ def generate(ops: Sequence[tuple[int, int]]) -> list[Event]:
                     job,
                     T.LEASE_ACQUIRED,
                     {"worker": f"w{choice % 3}", "lease_until": choice * 0.5},
-                    epoch=choice % 5,
                 )
             )
         elif kind == "lease_lost":
-            out.append(mk(job, T.LEASE_LOST, {"worker": "w"}))
+            out.append(mk(job, T.LEASE_LOST, {"worker": "w", "reason": "takeover"}))
         elif kind == "noise":
             payload = {
                 "effect_id": str(choice),
@@ -346,6 +346,19 @@ def generate(ops: Sequence[tuple[int, int]]) -> list[Event]:
                     ts=float(choice),
                 )
             )
+    return with_epochs(out)
+
+
+def with_epochs(events: list[Event]) -> list[Event]:
+    """Give every event its job's current epoch, and ownership events current + 1 (fencing)."""
+    epoch: dict[str, int] = {}
+    out: list[Event] = []
+    for e in events:
+        n = epoch.get(e.job_id, 0)
+        if e.type in (T.LEASE_ACQUIRED, T.LEASE_LOST):
+            n += 1
+        epoch[e.job_id] = n
+        out.append(dataclasses.replace(e, epoch=n))
     return out
 
 
