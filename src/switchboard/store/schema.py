@@ -79,6 +79,28 @@ MIGRATIONS: tuple[str, ...] = (
       WHERE type = 'effect_outcome';
     ALTER TABLE effects ADD COLUMN policy TEXT NOT NULL DEFAULT 'unsafe';
     """,
+    # 4: density. The two indexes keyed by job (events_job on (job_id, seq), events_step on
+    # (job_id, type, step_id)) made every append a random B-tree insert, and at 10k concurrent
+    # jobs they were most of the writer's time (benchmarks/density.py; docs/benchmarks.md).
+    # They are replaced by things the writer already has in hand:
+    # - prev_seq: each event points at its job's previous event, and jobs.last_seq at the
+    #   newest, so read_job walks the chain by primary key (a recursive CTE) instead of an index;
+    # - step uniqueness is checked against the projection (jobs.last_step / last_responded)
+    #   under the write lock: steps are written in order, so n is a duplicate iff n <= the
+    #   highest recorded. Backfilled here from the log, then the indexes go.
+    """
+    ALTER TABLE events ADD COLUMN prev_seq INTEGER CHECK (prev_seq IS NULL OR prev_seq < seq);
+    UPDATE events SET prev_seq = (
+      SELECT MAX(p.seq) FROM events p WHERE p.job_id = events.job_id AND p.seq < events.seq
+    );
+    ALTER TABLE jobs ADD COLUMN last_responded INTEGER;
+    UPDATE jobs SET last_responded = (
+      SELECT MAX(e.step_id) FROM events e
+      WHERE e.job_id = jobs.job_id AND e.type = 'llm_responded'
+    );
+    DROP INDEX events_job;
+    DROP INDEX events_step;
+    """,
 )
 
 SCHEMA_VERSION = len(MIGRATIONS)

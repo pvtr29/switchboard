@@ -18,13 +18,15 @@ def test_replaced_matches_dataclasses_replace_for_every_field() -> None:
         lease_until=9.0,
         epoch=3,
         last_step=4,
+        last_responded=5,
         last_seq=1,
         created_at=1.0,
         updated_at=2.0,
     )
     assert {f.name for f in dataclasses.fields(Job)} == {
         "job_id", "kind", "task_ref", "state", "verdict", "budget", "usage", "owner",
-        "lease_until", "epoch", "last_step", "last_seq", "created_at", "updated_at",
+        "lease_until", "epoch", "last_step", "last_responded", "last_seq", "created_at",
+        "updated_at",
     }  # fmt: skip
     for changes in ({}, {"usage": Usage(tokens=7)}, {"state": JobState.FAILED, "owner": None}):
         assert _replaced(job, 8, 3.0, changes) == dataclasses.replace(

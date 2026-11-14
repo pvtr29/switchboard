@@ -199,7 +199,7 @@ def test_rebuild_restores_emptied_and_corrupted_projection(
     db.execute("UPDATE jobs SET state = 'done', usage = '{}', last_seq = 0")
     db.execute(
         "INSERT INTO jobs SELECT 'zombie', kind, task_ref, state, NULL, budget, usage, "
-        "NULL, NULL, 0, NULL, 1, 0, 0 FROM jobs LIMIT 1"
+        "NULL, NULL, 0, NULL, 1, 0, 0, NULL FROM jobs LIMIT 1"
     )
     assert log.rebuild() == 2
     assert live(log) == expected

@@ -12,6 +12,11 @@ original IllegalTransition is chained as `__cause__`), so callers need to catch 
 in any non-terminal state.
 Unknown extra payload keys are ignored (payloads may grow within a version).
 
+Step duplicates: `is_duplicate` says whether a `step_completed(n)` or `llm_responded(n)` is
+already in the log, from the projection alone (`last_step`, `last_responded`): steps are
+written in order, so n is a duplicate iff n <= the highest one recorded. The store asks it
+before inserting, under the write lock, instead of keeping a unique index on (job, type, step).
+
 Epoch fencing: every event after `job_created` must carry the job's current epoch, except the
 two ownership events, which must carry exactly current + 1 and so move the epoch forward:
 `lease_acquired` (a runner claims the job; sets the owner) and `lease_lost` (someone else takes
@@ -191,6 +196,10 @@ def apply(job: Job | None, event: Event) -> Job:
                     f"{_where(event)}: verdict requires state done, job is {job.state.value}"
                 )
             changes["verdict"] = verdict
+        case EventType.LLM_RESPONDED:
+            assert event.step_id is not None  # Event guarantees it for step events
+            if job.last_responded is None or event.step_id > job.last_responded:
+                changes["last_responded"] = event.step_id
         case EventType.STEP_COMPLETED:
             changes["last_step"] = event.step_id
             # Active seconds of the act/commit portion of the step ride in the commit itself,
@@ -231,6 +240,18 @@ def apply(job: Job | None, event: Event) -> Job:
     return _replaced(job, event.seq, event.ts, changes)
 
 
+def is_duplicate(job: Job | None, event: Event) -> bool:
+    """True if `event` is a step_completed / llm_responded for a step the job already has (see
+    module docstring). Every other event is never a duplicate by this rule."""
+    if job is None or event.step_id is None:
+        return False
+    if event.type is EventType.STEP_COMPLETED:
+        return job.last_step is not None and event.step_id <= job.last_step
+    if event.type is EventType.LLM_RESPONDED:
+        return job.last_responded is not None and event.step_id <= job.last_responded
+    return False
+
+
 def _replaced(job: Job, last_seq: int, updated_at: float, changes: dict[str, Any]) -> Job:
     """`dataclasses.replace(job, last_seq=..., updated_at=..., **changes)`, about 2x faster.
 
@@ -248,6 +269,7 @@ def _replaced(job: Job, last_seq: int, updated_at: float, changes: dict[str, Any
         "lease_until": job.lease_until,
         "epoch": job.epoch,
         "last_step": job.last_step,
+        "last_responded": job.last_responded,
         "last_seq": last_seq,
         "created_at": job.created_at,
         "updated_at": updated_at,

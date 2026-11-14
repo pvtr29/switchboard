@@ -39,7 +39,7 @@ from typing import Any
 from switchboard.agents.fake import FakeAgent
 from switchboard.core import Event, EventType, Job
 from switchboard.daemon.bus import EventBus, Gap, Subscription
-from switchboard.daemon.protocol import dumps_line, event_message, gap_message
+from switchboard.daemon.protocol import dumps_line, event_line, gap_message
 from switchboard.obs import LoopLagMonitor, tune_gc
 from switchboard.runtime.supervisor import Supervisor
 from switchboard.store import EventStore
@@ -112,11 +112,9 @@ async def consume(sub: Subscription, encode: bool, counter: list[int]) -> None:
             return
         if encode:
             data = b"".join(
-                dumps_line(
-                    gap_message("s", item.from_seq, item.to_seq)
-                    if isinstance(item, Gap)
-                    else event_message("s", item)
-                )
+                dumps_line(gap_message("s", item.from_seq, item.to_seq))
+                if isinstance(item, Gap)
+                else event_line("s", item)
                 for item in batch
             )
             counter[1] += len(data)

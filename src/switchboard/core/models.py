@@ -172,6 +172,10 @@ class Event:
     type: EventType
     v: int = 1
     payload: Mapping[str, Any]
+    payload_json: str | None = dataclasses.field(default=None, compare=False, repr=False)
+    """The payload as the store wrote it (canonical JSON), on events read from or committed to
+    the log; None on events not yet appended. Lets a client feed send the payload without
+    encoding it a second time (protocol.event_line). Not part of equality."""
 
     def __post_init__(self) -> None:
         if not self.job_id:
@@ -204,6 +208,7 @@ class Job:
     lease_until: float | None = None
     epoch: int = 0
     last_step: int | None = None
+    last_responded: int | None = None  # highest step with a logged llm_responded
     last_seq: int
     created_at: float
     updated_at: float

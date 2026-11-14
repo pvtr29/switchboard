@@ -22,6 +22,7 @@ from switchboard.core import (
     usage_from_dict,
     usage_to_dict,
 )
+from switchboard.core.projection import is_duplicate
 
 T = EventType
 S = JobState
@@ -285,6 +286,21 @@ def test_two_claims_from_the_same_epoch_exactly_one_wins() -> None:
         apply(first, ev(T.LEASE_ACQUIRED, {"worker": "b"}, seq=3, epoch=1))
 
 
+def test_step_duplicates_are_judged_from_the_projection() -> None:
+    job = created()
+    resp = {T.LLM_RESPONDED: "last_responded", T.STEP_COMPLETED: "last_step"}
+    for type_ in resp:
+        assert not is_duplicate(job, ev(type_, step=0))  # nothing logged yet
+    job = apply(job, ev(T.LLM_RESPONDED, step=0, seq=2))
+    assert is_duplicate(job, ev(T.LLM_RESPONDED, step=0))
+    assert not is_duplicate(job, ev(T.STEP_COMPLETED, step=0))  # responded, not committed
+    job = apply(job, ev(T.STEP_COMPLETED, {"delta": []}, step=0, seq=3))
+    assert is_duplicate(job, ev(T.STEP_COMPLETED, step=0))
+    assert not is_duplicate(job, ev(T.LLM_RESPONDED, step=1))
+    assert not is_duplicate(job, ev(T.STEP_STARTED, step=0))  # one per attempt: never
+    assert not is_duplicate(None, ev(T.STEP_COMPLETED, step=0))
+
+
 def test_stale_epoch_is_a_projection_error() -> None:
     assert issubclass(StaleEpoch, ProjectionError)  # one except clause still catches both
 
@@ -389,7 +405,8 @@ def test_runtime_bookkeeping_events_change_nothing_but_seq(type_: EventType) -> 
     job = created()
     step = 3 if type_ in STEP_EVENT_TYPES else None
     after = apply(job, ev(type_, {"anything": 1}, seq=2, step=step, ts=11.0))
-    assert after == dataclasses.replace(job, last_seq=2, updated_at=11.0)
+    responded = 3 if type_ is T.LLM_RESPONDED else None
+    assert after == dataclasses.replace(job, last_seq=2, updated_at=11.0, last_responded=responded)
     assert after.last_step is None
 
 

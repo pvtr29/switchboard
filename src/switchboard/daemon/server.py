@@ -117,7 +117,7 @@ from switchboard.daemon.protocol import (
     Request,
     dumps_line,
     error_response,
-    event_message,
+    event_line,
     gap_message,
     job_to_dict,
     ok_response,
@@ -394,11 +394,9 @@ class Connection:
                 return
             await self.send_bytes(
                 b"".join(
-                    dumps_line(
-                        gap_message(sub_id, item.from_seq, item.to_seq)
-                        if isinstance(item, Gap)
-                        else event_message(sub_id, item)
-                    )
+                    dumps_line(gap_message(sub_id, item.from_seq, item.to_seq))
+                    if isinstance(item, Gap)
+                    else event_line(sub_id, item)
                     for item in batch
                 )
             )
@@ -415,9 +413,7 @@ class Connection:
             after = last
             sub.floor = max(sub.floor, last)
             chunk = b"".join(
-                dumps_line(event_message(sub_id, e))
-                for e in page
-                if sub.job_id is None or e.job_id == sub.job_id
+                event_line(sub_id, e) for e in page if sub.job_id is None or e.job_id == sub.job_id
             )
             if chunk:
                 await self.send_bytes(chunk)

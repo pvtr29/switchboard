@@ -146,6 +146,34 @@ def event_message(sub_id: str, e: Event) -> dict[str, Any]:
     return {"v": PROTOCOL_VERSION, "id": sub_id, "event": event_to_dict(e), "seq": e.seq}
 
 
+_compact = json.JSONEncoder(separators=(",", ":")).encode
+
+
+def event_line(sub_id: str, e: Event) -> bytes:
+    """`dumps_line(event_message(sub_id, e))`, without re-encoding the payload when the event
+    carries the JSON the store wrote (`Event.payload_json`): the payload is spliced in as is.
+    At thousands of events per second the second encode was the largest JSON cost in the
+    daemon. Same message, same key order; only the payload's own keys come out sorted."""
+    raw = e.payload_json
+    if raw is None:
+        return dumps_line(event_message(sub_id, e))
+    head = _compact(
+        {
+            "seq": e.seq,
+            "job_id": e.job_id,
+            "epoch": e.epoch,
+            "step_id": e.step_id,
+            "ts": e.ts,
+            "type": e.type.value,
+            "v": e.v,
+        }
+    )
+    return (
+        f'{{"v":{PROTOCOL_VERSION},"id":{_compact(sub_id)},"event":{head[:-1]},'
+        f'"payload":{raw}}},"seq":{_compact(e.seq)}}}\n'
+    ).encode()
+
+
 def gap_message(sub_id: str, from_seq: int, to_seq: int) -> dict[str, Any]:
     return {
         "v": PROTOCOL_VERSION,

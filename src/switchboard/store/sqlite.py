@@ -1,5 +1,6 @@
 """SQLite event log. Synchronous; one connection owned by one thread."""
 
+import functools
 import json
 import sqlite3
 from collections.abc import Mapping, Sequence
@@ -21,6 +22,7 @@ from switchboard.core import (
     usage_from_dict,
     usage_to_dict,
 )
+from switchboard.core.projection import is_duplicate
 from switchboard.store.interface import (
     AppendResult,
     AppendStatus,
@@ -34,6 +36,21 @@ from switchboard.store.schema import migrate
 PAYLOAD_VERSIONS: Mapping[EventType, int] = MappingProxyType({t: 1 for t in EventType})
 
 _COLUMNS = "seq, job_id, epoch, step_id, ts, type, v, payload"
+_INSERT = (
+    "INSERT INTO events (job_id, epoch, step_id, ts, type, v, payload, prev_seq) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING RETURNING seq"
+)
+# `seq IN (chain)` lets SQLite fetch each row by primary key; joining the CTE back to events
+# made it scan events instead (20 ms for an 80-event job in a 1M-event log, vs 0.2 ms).
+_READ_JOB = f"""
+WITH RECURSIVE chain(seq, prev) AS (
+  SELECT seq, prev_seq FROM events
+  WHERE seq = (SELECT last_seq FROM jobs WHERE job_id = ?1) AND seq > ?2
+  UNION ALL
+  SELECT e.seq, e.prev_seq FROM chain JOIN events e ON e.seq = chain.prev WHERE e.seq > ?3
+)
+SELECT {_COLUMNS} FROM events WHERE seq IN (SELECT seq FROM chain) ORDER BY seq
+"""
 
 
 def open_db(path: str | Path) -> sqlite3.Connection:
@@ -99,6 +116,7 @@ def _row_to_event(row: tuple[Any, ...]) -> Event:
         type=etype,
         v=v,
         payload=json.loads(payload),
+        payload_json=payload,
     )
 
 
@@ -171,13 +189,37 @@ def encode_event(e: Event) -> Row:
 
 _JOB_COLUMNS = (
     "job_id, kind, task_ref, state, verdict, budget, usage, owner, lease_until, epoch, "
-    "last_step, last_seq, created_at, updated_at"
+    "last_step, last_responded, last_seq, created_at, updated_at"
 )
 _UPSERT_JOB = (
-    f"INSERT INTO jobs ({_JOB_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+    f"INSERT INTO jobs ({_JOB_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
     "ON CONFLICT (job_id) DO UPDATE SET "
     + ", ".join(f"{c} = excluded.{c}" for c in _JOB_COLUMNS.split(", ")[1:])
 )
+_CHUNK = 64  # rows per multi-row statement: 64 * 15 job columns stays far below 32766 variables
+
+
+@functools.cache
+def _insert_many(n: int) -> str:
+    row = "(" + ", ".join("?" * 9) + ")"
+    return (
+        "INSERT INTO events (seq, job_id, epoch, step_id, ts, type, v, payload, prev_seq) "
+        "VALUES " + ", ".join([row] * n)
+    )
+
+
+@functools.cache
+def _upsert_many(n: int) -> str:
+    row = "(" + ", ".join("?" * len(_JOB_COLUMNS.split(", "))) + ")"
+    return _UPSERT_JOB.replace(
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", "VALUES " + ", ".join([row] * n)
+    )
+
+
+def _upsert_jobs(conn: sqlite3.Connection, jobs: list[Job]) -> None:
+    for lo in range(0, len(jobs), _CHUNK):
+        chunk = jobs[lo : lo + _CHUNK]
+        conn.execute(_upsert_many(len(chunk)), [v for j in chunk for v in _job_to_row(j)])
 
 
 _dumps = json.JSONEncoder(separators=(",", ":"), allow_nan=False).encode
@@ -196,6 +238,7 @@ def _job_to_row(j: Job) -> tuple[Any, ...]:
         j.lease_until,
         j.epoch,
         j.last_step,
+        j.last_responded,
         j.last_seq,
         j.created_at,
         j.updated_at,
@@ -204,7 +247,7 @@ def _job_to_row(j: Job) -> tuple[Any, ...]:
 
 def _row_to_job(row: tuple[Any, ...]) -> Job:
     (job_id, kind, task_ref, state, verdict, budget, usage, owner, lease_until) = row[:9]
-    epoch, last_step, last_seq, created_at, updated_at = row[9:]
+    epoch, last_step, last_responded, last_seq, created_at, updated_at = row[9:]
     return Job(
         job_id=job_id,
         kind=JobKind(kind),
@@ -217,6 +260,7 @@ def _row_to_job(row: tuple[Any, ...]) -> Job:
         lease_until=lease_until,
         epoch=epoch,
         last_step=last_step,
+        last_responded=last_responded,
         last_seq=last_seq,
         created_at=created_at,
         updated_at=updated_at,
@@ -226,8 +270,8 @@ def _row_to_job(row: tuple[Any, ...]) -> Job:
 _set = object.__setattr__
 
 
-def _with_seq(e: Event, seq: int) -> Event:
-    """Copy of an already validated event with `seq` set.
+def _with_seq(e: Event, seq: int, payload_json: str | None = None) -> Event:
+    """Copy of an already validated event with `seq` (and the stored payload text) set.
 
     Skips Event.__post_init__ (validation and the payload copy were done when `e` was built and
     the payload is already an immutable view), which made this the top allocation on the commit
@@ -242,6 +286,7 @@ def _with_seq(e: Event, seq: int) -> Event:
     _set(new, "type", e.type)
     _set(new, "v", e.v)
     _set(new, "payload", e.payload)
+    _set(new, "payload_json", payload_json)
     return new
 
 
@@ -313,50 +358,29 @@ class SQLiteEventLog:
         conn = self._conn
         self.last_changed = {}
         outcomes: list[GroupResult] = []
-        pending: dict[str, Job] = {}  # committed-by-savepoint, not yet by the transaction
+        pending: dict[str, Job] = {}  # folded by a successful group, not yet committed
         conn.execute("BEGIN IMMEDIATE")
         try:
-            if self._cache and self._max_seq() != self._head:
+            head = self._max_seq()
+            if self._cache and head != self._head:
                 self._cache.clear()  # another writer appended since our last commit
+            next_seq = (head or 0) + 1
+            buffered: list[tuple[Any, ...]] = []  # fast-path rows (seq first), not yet inserted
             for group, rows in zip(groups, encoded, strict=True):
                 if not rows:
                     outcomes.append([])
                     continue
-                conn.execute("SAVEPOINT grp")
-                results: list[AppendResult] = []
-                staged: dict[str, Job | None] = {}
-                try:
-                    for event, row in zip(group, rows, strict=True):
-                        got = conn.execute(
-                            "INSERT INTO events (job_id, epoch, step_id, ts, type, v, payload) "
-                            "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING RETURNING seq",
-                            row,
-                        ).fetchone()
-                        if got is None:
-                            results.append(AppendResult(AppendStatus.DUPLICATE, None))
-                            continue
-                        seq = int(got[0])
-                        results.append(AppendResult(AppendStatus.INSERTED, seq))
-                        if event.type in _EFFECT_EVENTS:
-                            _project_effect(conn, event)
-                        jid = event.job_id
-                        if jid not in staged:
-                            staged[jid] = self._lookup(pending, jid)
-                        staged[jid] = apply(staged[jid], _with_seq(event, seq))
-                # ValueError, not just ProjectionError: any validation failure in the fold (e.g. a
-                # model __post_init__ check) must stay this group's problem, never abort the batch.
-                # sqlite3.Error is not a ValueError, so real database errors still abort.
-                except ValueError as exc:
-                    conn.execute("ROLLBACK TO grp")
-                    conn.execute("RELEASE grp")
-                    outcomes.append(exc)
+                if any(e.type in _EFFECT_EVENTS for e in group):
+                    # Effect events dedupe by unique index and project into `effects` with SQL,
+                    # so they take the row-at-a-time path; the buffer goes first to keep order.
+                    self._insert_rows(buffered)
+                    outcomes.append(self._append_one_by_one(group, rows, pending))
+                    next_seq = (self._max_seq() or 0) + 1
                     continue
-                conn.execute("RELEASE grp")
-                for jid, job in staged.items():
-                    if job is not None:
-                        pending[jid] = job
-                outcomes.append(results)
-            conn.executemany(_UPSERT_JOB, [_job_to_row(j) for j in pending.values()])
+                outcomes.append(self._fold_group(group, rows, pending, next_seq, buffered))
+                next_seq = (buffered[-1][0] + 1) if buffered else next_seq
+            self._insert_rows(buffered)
+            _upsert_jobs(conn, list(pending.values()))
             head = self._max_seq()
             conn.execute("COMMIT")
         except BaseException:
@@ -369,6 +393,92 @@ class SQLiteEventLog:
         self._head = head
         self.last_changed = pending
         return outcomes
+
+    def _fold_group(
+        self,
+        group: Sequence[Event],
+        rows: Sequence[Row],
+        pending: dict[str, Job],
+        next_seq: int,
+        buffered: list[tuple[Any, ...]],
+    ) -> GroupResult:
+        """Fast path: dedupe and fold the group in Python with the seqs its rows WILL get, and
+        queue the rows for one multi-row INSERT. Nothing touches SQLite here, so a rejected
+        group needs no savepoint: its rows are simply never queued. Seqs are given explicitly:
+        we hold the write lock, so head + 1, head + 2, ... are free, and a PK conflict (which
+        would mean they were not) aborts the transaction instead of corrupting anything."""
+        results: list[AppendResult] = []
+        staged: dict[str, Job | None] = {}
+        out: list[tuple[Any, ...]] = []
+        try:
+            for event, row in zip(group, rows, strict=True):
+                jid = event.job_id
+                if jid not in staged:
+                    staged[jid] = self._lookup(pending, jid)
+                job = staged[jid]
+                if is_duplicate(job, event):
+                    results.append(AppendResult(AppendStatus.DUPLICATE, None))
+                    continue
+                seq = next_seq + len(out)
+                out.append((seq, *row, None if job is None else job.last_seq))
+                staged[jid] = apply(job, _with_seq(event, seq, row[6]))
+                results.append(AppendResult(AppendStatus.INSERTED, seq))
+        # ValueError, not just ProjectionError: any validation failure in the fold (e.g. a model
+        # __post_init__ check) must stay this group's problem, never abort the batch.
+        except ValueError as exc:
+            return exc
+        buffered.extend(out)
+        for jid, staged_job in staged.items():
+            if staged_job is not None:
+                pending[jid] = staged_job
+        return results
+
+    def _append_one_by_one(
+        self, group: Sequence[Event], rows: Sequence[Row], pending: dict[str, Job]
+    ) -> GroupResult:
+        """Row-at-a-time path in a SAVEPOINT, for groups with effect events (see caller)."""
+        conn = self._conn
+        conn.execute("SAVEPOINT grp")
+        results: list[AppendResult] = []
+        staged: dict[str, Job | None] = {}
+        try:
+            for event, row in zip(group, rows, strict=True):
+                jid = event.job_id
+                if jid not in staged:
+                    staged[jid] = self._lookup(pending, jid)
+                job = staged[jid]
+                if is_duplicate(job, event):
+                    results.append(AppendResult(AppendStatus.DUPLICATE, None))
+                    continue
+                # ON CONFLICT: effect intents/outcomes dedupe by unique index.
+                got = conn.execute(_INSERT, (*row, None if job is None else job.last_seq))
+                got = got.fetchone()
+                if got is None:
+                    results.append(AppendResult(AppendStatus.DUPLICATE, None))
+                    continue
+                seq = int(got[0])
+                results.append(AppendResult(AppendStatus.INSERTED, seq))
+                if event.type in _EFFECT_EVENTS:
+                    _project_effect(conn, event)
+                staged[jid] = apply(job, _with_seq(event, seq))
+        except ValueError as exc:  # sqlite3.Error is not a ValueError: those still abort
+            conn.execute("ROLLBACK TO grp")
+            conn.execute("RELEASE grp")
+            return exc
+        conn.execute("RELEASE grp")
+        for jid, staged_job in staged.items():
+            if staged_job is not None:
+                pending[jid] = staged_job
+        return results
+
+    def _insert_rows(self, buffered: list[tuple[Any, ...]]) -> None:
+        """INSERT the queued rows, `_CHUNK` per statement, and empty the buffer. One statement
+        is one sqlite3_step, i.e. one GIL release; row-at-a-time inserts released and re-took
+        the GIL per row, and under load each re-take waited for the event loop thread."""
+        for lo in range(0, len(buffered), _CHUNK):
+            chunk = buffered[lo : lo + _CHUNK]
+            self._conn.execute(_insert_many(len(chunk)), [v for r in chunk for v in r])
+        buffered.clear()
 
     def _max_seq(self) -> int | None:
         row = self._conn.execute("SELECT MAX(seq) FROM events").fetchone()
@@ -438,7 +548,7 @@ class SQLiteEventLog:
                         _project_effect(conn, e)
                     jobs[e.job_id] = apply(jobs.get(e.job_id), e)
             conn.execute("DELETE FROM jobs")
-            conn.executemany(_UPSERT_JOB, [_job_to_row(j) for j in jobs.values()])
+            _upsert_jobs(conn, list(jobs.values()))
             conn.execute("COMMIT")
         except BaseException:
             if conn.in_transaction:
@@ -454,10 +564,9 @@ class SQLiteEventLog:
         return [_row_to_event(r) for r in cur.fetchall()]
 
     def read_job(self, job_id: str, after_seq: int = 0) -> list[Event]:
-        cur = self._conn.execute(
-            f"SELECT {_COLUMNS} FROM events WHERE job_id = ? AND seq > ? ORDER BY seq",
-            (job_id, after_seq),
-        )
+        """The job's events after `after_seq`, in order: a walk down the prev_seq chain from
+        jobs.last_seq (every inserted event is folded, so last_seq is the job's newest)."""
+        cur = self._conn.execute(_READ_JOB, (job_id, after_seq, after_seq))
         return [_row_to_event(r) for r in cur.fetchall()]
 
     def last_seq(self) -> int:

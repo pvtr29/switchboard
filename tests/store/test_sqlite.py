@@ -66,20 +66,20 @@ def jlog(log: SQLiteEventLog) -> SQLiteEventLog:
 
 def test_migrate_fresh_creates_everything(tmp_path: Path) -> None:
     with closing(sqlite3.connect(tmp_path / "raw.db", isolation_level=None)) as conn:
-        assert migrate(conn) == 3 == SCHEMA_VERSION
+        assert migrate(conn) == 4 == SCHEMA_VERSION
         names = {
             r[0]
             for r in conn.execute("SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")
         }
         assert {"schema_version", "events", "snapshots", "effects", "jobs"} <= names
-        assert {"events_job", "events_step"} <= names
-        assert conn.execute("SELECT version FROM schema_version").fetchall() == [(3,)]
+        assert not {"events_job", "events_step"} & names  # dropped by migration 4
+        assert conn.execute("SELECT version FROM schema_version").fetchall() == [(4,)]
 
 
 def test_migrate_twice_is_noop(tmp_path: Path) -> None:
     with closing(sqlite3.connect(tmp_path / "raw.db", isolation_level=None)) as conn:
         migrate(conn)
-        assert migrate(conn) == 3
+        assert migrate(conn) == SCHEMA_VERSION
         assert conn.execute("SELECT COUNT(*) FROM schema_version").fetchone() == (1,)
 
 
@@ -200,9 +200,17 @@ def test_future_version_rejected_on_append(log: SQLiteEventLog) -> None:
 
 
 def _raw_insert(db: sqlite3.Connection, type_: str, v: int) -> None:
-    db.execute(
-        "INSERT INTO events (job_id, epoch, ts, type, v, payload) VALUES ('j', 0, 0, ?, ?, '{}')",
+    """A row written behind the log's back, linked as job j's newest event so read_job sees it."""
+    (seq,) = db.execute(
+        "INSERT INTO events (job_id, epoch, ts, type, v, payload) "
+        "VALUES ('j', 0, 0, ?, ?, '{}') RETURNING seq",
         (type_, v),
+    ).fetchone()
+    db.execute(
+        "INSERT INTO jobs (job_id, kind, task_ref, state, budget, usage, last_seq, created_at, "
+        "updated_at) VALUES ('j', 'fake', 't', 'queued', '{}', '{}', ?, 0, 0) "
+        "ON CONFLICT (job_id) DO UPDATE SET last_seq = excluded.last_seq",
+        (seq,),
     )
 
 
@@ -281,8 +289,8 @@ def test_migration_2_upgrades_a_v1_database(tmp_path: Path) -> None:
                 "INSERT INTO events (job_id, epoch, step_id, ts, type, v, payload) "
                 "VALUES ('j', 0, 1, 1.0, 'llm_responded', 1, '{}')"
             )
-        assert migrate(conn) == 3
-        assert conn.execute("SELECT version FROM schema_version").fetchall() == [(3,)]
+        assert migrate(conn) == SCHEMA_VERSION
+        assert conn.execute("SELECT version FROM schema_version").fetchall() == [(SCHEMA_VERSION,)]
         assert conn.execute("SELECT COUNT(*) FROM events").fetchone() == (1,)
         conn.execute(
             "INSERT INTO events (job_id, epoch, step_id, ts, type, v, payload) "
@@ -336,3 +344,98 @@ def test_a_second_writer_on_the_same_database_invalidates_the_job_cache(tmp_path
             old.append_many([at(1, EventType.USAGE_RECORDED)])
         assert old.append_many([at(2, EventType.USAGE_RECORDED)])[0].status is AppendStatus.INSERTED
         assert [e.epoch for e in new.read_job("j1")] == [0, 1, 1, 2, 2]
+
+
+def test_migration_4_links_old_events_and_keeps_step_dedupe(tmp_path: Path) -> None:
+    """A v3 database (job-keyed indexes, no prev_seq) upgrades to the chain layout: read_job
+    returns the same events, and the steps already logged are still duplicates afterwards."""
+    from switchboard.store.schema import MIGRATIONS
+
+    path = tmp_path / "v3.db"
+    with closing(sqlite3.connect(path, isolation_level=None)) as conn:
+        script = "\n".join(MIGRATIONS[:3])
+        conn.executescript(f"BEGIN;\n{script}\nINSERT INTO schema_version VALUES (3);\nCOMMIT;")
+        # Raw v3-style rows (no prev_seq): today's SQLiteEventLog would write the new layout.
+        for job, type_, step in [
+            ("a", "job_created", None),
+            ("b", "job_created", None),
+            ("a", "llm_responded", 0),
+            ("b", "usage_recorded", None),
+            ("a", "step_completed", 0),
+            ("a", "llm_responded", 1),
+        ]:
+            payload = (
+                '{"kind":"fake","task_ref":"t","budget":{},"seed":0}'
+                if type_ == "job_created"
+                else '{"delta":[],"done":false}'
+                if type_ == "step_completed"
+                else "{}"
+            )
+            conn.execute(
+                "INSERT INTO events (job_id, epoch, step_id, ts, type, v, payload) "
+                "VALUES (?, 0, ?, 1.0, ?, 1, ?)",
+                (job, step, type_, payload),
+            )
+    with closing(open_db(path)) as conn:
+        log = SQLiteEventLog(conn)
+        assert log.rebuild() == 2  # projection (incl. last_responded) from the migrated log
+        prev = conn.execute("SELECT seq, prev_seq FROM events ORDER BY seq").fetchall()
+        assert prev == [(1, None), (2, None), (3, 1), (4, 2), (5, 3), (6, 5)]
+        assert [e.seq for e in log.read_job("a")] == [1, 3, 5, 6]
+        assert [e.seq for e in log.read_job("a", after_seq=3)] == [5, 6]
+        assert [e.seq for e in log.read_job("b")] == [2, 4]
+        a = log.get_job("a")
+        assert a is not None
+        assert (a.last_step, a.last_responded) == (0, 1)
+        again = [
+            Event(job_id="a", epoch=0, step_id=1, ts=2.0, type=EventType.LLM_RESPONDED, payload={}),
+            Event(
+                job_id="a",
+                epoch=0,
+                step_id=0,
+                ts=2.0,
+                type=EventType.STEP_COMPLETED,
+                payload={"delta": [], "done": False},
+            ),
+        ]
+        assert [r.status for r in log.append_many(again)] == [AppendStatus.DUPLICATE] * 2
+
+
+def test_read_job_follows_the_chain_across_interleaved_jobs(log: SQLiteEventLog) -> None:
+    log.append_many(created("x", "y"))
+    for i in range(30):
+        log.append_many([ev("x" if i % 3 else "y", n=i)])
+    xs = log.read_job("x")
+    seqs = [e.seq or 0 for e in xs]
+    assert seqs == sorted(seqs)
+    assert len(xs) == 1 + 20
+    assert [e.payload["n"] for e in xs[1:]] == [i for i in range(30) if i % 3]
+    assert log.read_job("nope") == []
+    assert log.read_job("x", after_seq=log.last_seq()) == []
+
+
+def test_a_batch_mixing_fast_and_effect_groups_keeps_seq_order(log: SQLiteEventLog) -> None:
+    """Effect groups take the row-at-a-time path; the multi-row buffer is flushed before them,
+    so seqs stay in group order and every job's prev_seq chain stays intact."""
+    log.append_many(created("a", "b"))
+    intent = Event(
+        job_id="b",
+        epoch=0,
+        ts=1.0,
+        type=EventType.EFFECT_INTENT,
+        payload={"effect_id": "e1", "kind": "k", "args_hash": "h", "policy": "keyed", "step": 0},
+    )
+    groups = [[ev("a", n=1), ev("b", n=2)], [intent], [ev("a", n=3)], [intent], [ev("b", n=4)]]
+    outcomes = log.append_groups(groups)
+    statuses = [[r.status for r in o] for o in outcomes if not isinstance(o, Exception)]
+    ins, dup = AppendStatus.INSERTED, AppendStatus.DUPLICATE
+    assert statuses == [[ins, ins], [ins], [ins], [dup], [ins]]
+    seqs = [r.seq for o in outcomes if not isinstance(o, Exception) for r in o if r.seq]
+    assert seqs == list(range(seqs[0], seqs[0] + 5))
+    assert [e.payload.get("n") for e in log.read_job("a")[1:]] == [1, 3]
+    assert [e.type for e in log.read_job("b")[1:]] == [
+        EventType.USAGE_RECORDED,
+        EventType.EFFECT_INTENT,
+        EventType.USAGE_RECORDED,
+    ]
+    assert log.get_effect("e1") is not None

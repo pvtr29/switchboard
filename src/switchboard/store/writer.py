@@ -309,8 +309,8 @@ class EventStore:
                     raise RuntimeError("append_groups returned a wrong number of results")
                 if self._listeners:
                     committed.extend(
-                        _with_seq(e, r.seq)
-                        for e, r in zip(group, outcome, strict=True)
+                        _with_seq(e, r.seq, row[6])  # row[6]: the payload JSON as stored
+                        for e, r, row in zip(group, outcome, item.rows, strict=True)
                         if r.seq is not None
                     )
                 self._events_written += sum(r.status is AppendStatus.INSERTED for r in outcome)
