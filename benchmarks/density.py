@@ -40,7 +40,7 @@ from switchboard.agents.fake import FakeAgent
 from switchboard.core import Event, EventType, Job
 from switchboard.daemon.bus import EventBus, Gap, Subscription
 from switchboard.daemon.protocol import dumps_line, event_line, gap_message
-from switchboard.obs import LoopLagMonitor, tune_gc
+from switchboard.obs import GcScheduler, LoopLagMonitor, tune_gc
 from switchboard.runtime.supervisor import Supervisor
 from switchboard.store import EventStore
 
@@ -142,6 +142,7 @@ async def run_tier(
     freeze_gc: bool = False,
     jitter: float = 0.5,
     linger: float = 0.0,
+    gc_mode: str = "scheduled",
 ) -> TierResult:
     # events/s/agent = EVENTS_PER_STEP / (AVG_TOKENS * token_interval)
     token_interval = EVENTS_PER_STEP / (AVG_TOKENS * event_rate)
@@ -184,6 +185,9 @@ async def run_tier(
             asyncio.create_task(consume(s, encode, c), name=f"sb-bench-consumer-{i}")
             for i, (s, c) in enumerate(zip(subs, counters, strict=True))
         ]
+        gcs = GcScheduler() if gc_mode == "scheduled" else None
+        if gcs is not None:
+            gcs.start()
         lag = LoopLagMonitor(lag_interval, window=int((duration + 5) / lag_interval) + 1000)
         lag.start()
         depths: list[int] = []
@@ -259,6 +263,8 @@ async def run_tier(
         # Teardown: nothing is written on cancel (jobs stay `running`; this DB is thrown away).
         sampler.cancel()
         await lag.stop()
+        if gcs is not None:
+            await gcs.stop()
         await sup.aclose()
         for s in subs:
             s.close()
@@ -310,6 +316,7 @@ async def main(args: argparse.Namespace) -> None:
             freeze_gc=args.freeze_gc,
             jitter=args.jitter,
             linger=args.linger,
+            gc_mode=args.gc_mode,
         )
         rows.append(row)
         print(format_table([row]))
@@ -354,6 +361,13 @@ if __name__ == "__main__":
         help="gc.set_threshold, e.g. 50000,20,100 (default: the daemon's tuning, obs.tuning)",
     )
     ap.add_argument("--no-gc-tuning", action="store_true", help="CPython's default GC thresholds")
+    ap.add_argument(
+        "--gc-mode",
+        choices=["scheduled", "threshold"],
+        default="scheduled",
+        help="scheduled: GcScheduler, as sb daemon (default); threshold: automatic GC with "
+        "--gc-threshold / tune_gc",
+    )
     ap.add_argument("--freeze-gc", action="store_true", help="gc.freeze() before measuring")
     ap.add_argument("--jitter", type=float, default=0.5, help="token pause jitter fraction")
     ap.add_argument(
@@ -371,6 +385,6 @@ if __name__ == "__main__":
         sys.setswitchinterval(parsed.switch_interval)
     if parsed.gc_threshold is not None:
         gc.set_threshold(*[int(x) for x in parsed.gc_threshold.split(",")])
-    elif not parsed.no_gc_tuning:
-        tune_gc()  # what `sb daemon` does by default
+    elif not parsed.no_gc_tuning and parsed.gc_mode == "threshold":
+        tune_gc()  # the automatic-GC tuning sb daemon used before GcScheduler
     asyncio.run(main(parsed))

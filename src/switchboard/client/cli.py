@@ -24,8 +24,8 @@ from typing import Any
 
 from switchboard import __version__
 from switchboard.client.conn import Client, ClientError
+from switchboard.obs.gc_scheduler import GcScheduler
 from switchboard.obs.logging import configure_logging
-from switchboard.obs.tuning import tune_gc
 
 DEFAULT_HOME = "~/.switchboard"
 TERMINAL_STATES = frozenset({"done", "failed", "cancelled"})
@@ -124,7 +124,8 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument(
         "--no-gc-tuning",
         action="store_true",
-        help="keep CPython's default garbage collector thresholds",
+        help="leave CPython's automatic garbage collection on (default: the loop schedules "
+        "short young collections and freezes survivors, see obs/gc_scheduler.py)",
     )
     d.add_argument("--sink-db", metavar="PATH", help="give jobs a persistent fake external sink")
     d.add_argument(
@@ -273,6 +274,14 @@ def format_stats(st: dict[str, Any]) -> str:
             f"(interval {_ms(lag['interval_s'])})"
             + (" [asyncio debug on]" if st.get("debug_asyncio") else "")
         )
+    gcs = st.get("gc")
+    if gcs is not None:
+        young = gcs["young"]
+        lines.append(
+            f"gc: young p50={_ms(young['p50'])} p99={_ms(young['p99'])} max={_ms(young['max'])} "
+            f"count={young['count']} full_sweeps={gcs['full_sweeps']} "
+            f"last_full={_ms(gcs['last_full_s'])} frozen={gcs['frozen']}"
+        )
     lat = st.get("store_latency")
     store = st["store"]
     if lat is not None:
@@ -385,9 +394,8 @@ def _run_daemon(args: argparse.Namespace) -> int:
     from switchboard.daemon.server import Daemon, DaemonError
 
     configure_logging(json=args.log_format == "json", level=args.log_level)
-    if not args.no_gc_tuning:
-        tune_gc()
     daemon = Daemon(
+        gc_scheduler=None if args.no_gc_tuning else GcScheduler(),
         socket_path=args.socket,
         db_path=args.db,
         envs_dir=args.envs,

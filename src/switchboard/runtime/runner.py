@@ -134,12 +134,22 @@ def default_worker_id() -> str:
 
 
 class _LogView:
-    """The parts of a job's event log the runner needs, decoded once per read."""
+    """The parts of a job's event log the runner needs, decoded once per read.
+
+    It keeps only what later steps use, not the events themselves: the conversation (the
+    deltas of committed steps, as one list), each committed step's env_ref, the config hashes
+    seen, and the logged response of a step that has not committed yet. With thousands of jobs
+    in one process, keeping every Event (each with a payload dict and a mappingproxy) made the
+    live heap grow by several GC-tracked objects per event, and every young-generation
+    collection walks the objects that stayed alive since the last one: that was the main
+    source of event-loop stalls at 10k agents (reports/density-10k.md)."""
 
     def __init__(self, events: Sequence[Event]) -> None:
         self.created: Event | None = None
-        self.responded: dict[int, Event] = {}
-        self.completed: dict[int, Event] = {}
+        self.responded: dict[int, Event] = {}  # only for steps without step_completed yet
+        self.completed: dict[int, str | None] = {}  # step -> env_ref of S(step + 1)
+        self.messages: list[Message] = []  # deltas of steps 0..k, in step order
+        self.hashes: set[str] = set()
         self.started: Counter[int] = Counter()
         self.initial_ref: str | None = None
         self.ran = False  # the job has been in `running` at least once (see run_job)
@@ -158,12 +168,20 @@ class _LogView:
             match e.type:
                 case EventType.JOB_CREATED:
                     self.created = e
+                    if e.payload.get("config_hash"):
+                        self.hashes.add(str(e.payload["config_hash"]))
                 case EventType.LLM_RESPONDED:
                     assert e.step_id is not None
-                    self.responded[e.step_id] = e
+                    self._hash(e)
+                    if e.step_id not in self.completed:
+                        self.responded[e.step_id] = e
                 case EventType.STEP_COMPLETED:
                     assert e.step_id is not None
-                    self.completed[e.step_id] = e
+                    self._hash(e)
+                    ref = e.payload.get("env_ref")
+                    self.completed[e.step_id] = None if ref is None else str(ref)
+                    self.messages.extend(e.payload["delta"])
+                    self.responded.pop(e.step_id, None)
                 case EventType.STATE_CHANGED:
                     if e.payload.get("to") == JobState.RUNNING.value:
                         self.ran = True
@@ -177,6 +195,10 @@ class _LogView:
                 case _:
                     pass
 
+    def _hash(self, e: Event) -> None:
+        if "config_hash" in e.payload:
+            self.hashes.add(str(e.payload["config_hash"]))
+
     @property
     def seed(self) -> int:
         assert self.created is not None
@@ -188,17 +210,11 @@ class _LogView:
 
     def history(self) -> list[Message]:
         assert self.created is not None
-        out: list[Message] = list(self.created.payload.get("instructions", []))
-        for n in range(len(self.completed)):
-            out.extend(self.completed[n].payload["delta"])
-        return out
+        return [*self.created.payload.get("instructions", []), *self.messages]
 
     def ref_before(self, n: int) -> str | None:
         """S(n): the env_ref of step_completed(n-1), or the initial ref for n == 0."""
-        if n == 0:
-            return self.initial_ref
-        ref = self.completed[n - 1].payload.get("env_ref")
-        return None if ref is None else str(ref)
+        return self.initial_ref if n == 0 else self.completed[n - 1]
 
     def keep_refs(self, last: int) -> list[str]:
         """The initial ref plus the last `last` DISTINCT committed refs (a step that changed
@@ -207,22 +223,13 @@ class _LogView:
         for n in range(len(self.completed) - 1, -1, -1):
             if len(recent) >= last:
                 break
-            ref = self.completed[n].payload.get("env_ref")
-            if ref and str(ref) not in recent:
-                recent.append(str(ref))
+            ref = self.completed[n]
+            if ref and ref not in recent:
+                recent.append(ref)
         return [*([self.initial_ref] if self.initial_ref else []), *reversed(recent)]
 
     def recorded_hashes(self) -> set[str]:
-        assert self.created is not None
-        hashes = {
-            str(e.payload["config_hash"])
-            for e in (*self.responded.values(), *self.completed.values())
-            if "config_hash" in e.payload
-        }
-        initial = self.created.payload.get("config_hash", "")
-        if initial:
-            hashes.add(str(initial))
-        return hashes
+        return set(self.hashes)
 
 
 def _decode_response(e: Event) -> ModelResponse:

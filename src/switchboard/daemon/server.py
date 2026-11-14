@@ -126,7 +126,7 @@ from switchboard.daemon.protocol import (
 from switchboard.env.base import Environment
 from switchboard.env.dir_env import DirEnv
 from switchboard.llm.client import LLMClient
-from switchboard.obs import LoopLagMonitor
+from switchboard.obs import GcScheduler, LoopLagMonitor
 from switchboard.runtime.agent import Agent, ReplayPolicy, StepContext
 from switchboard.runtime.recovery import RecoveryReport, recover
 from switchboard.runtime.sinks import SQLiteSink
@@ -471,7 +471,9 @@ class Daemon:
         llm_factory: Callable[[tuple[str, ...]], LLMClient] | None = None,
         runner_factory: Callable[[Path], CommandRunner] = LocalSandboxRunner,
         default_rollout_tokens: int = DEFAULT_ROLLOUT_TOKENS,
+        gc_scheduler: GcScheduler | None = None,
     ) -> None:
+        self.gc_scheduler = gc_scheduler  # None: leave the collector as the process has it
         self.store_linger = store_linger
         self._api_key = api_key
         self._llm_factory = llm_factory
@@ -547,6 +549,8 @@ class Daemon:
         sock = await self._claim_socket()
         try:
             self.lag.start()
+            if self.gc_scheduler is not None:
+                self.gc_scheduler.start()
             self.envs_dir.mkdir(parents=True, exist_ok=True)
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             self._store = await EventStore.open(self.db_path, linger=self.store_linger)
@@ -683,6 +687,8 @@ class Daemon:
     async def _release(self) -> None:
         await self._stop_grading()
         await self.lag.stop()
+        if self.gc_scheduler is not None:
+            await self.gc_scheduler.stop()
         llms, self._llms = list(self._llms.values()), {}
         for llm in llms:
             aclose = getattr(llm, "aclose", None)  # optional: not part of the LLMClient protocol
@@ -1089,6 +1095,9 @@ class Daemon:
             "store": dataclasses.asdict(self.store.stats),
             "store_latency": dataclasses.asdict(self.store.latency),
             "loop_lag": dataclasses.asdict(self.lag.stats()),
+            "gc": (
+                None if self.gc_scheduler is None else dataclasses.asdict(self.gc_scheduler.stats())
+            ),
             "debug_asyncio": asyncio.get_running_loop().get_debug(),
             "bus": dataclasses.asdict(self.bus.stats),
             "recovery": (None if self.recovery is None else dataclasses.asdict(self.recovery)),
